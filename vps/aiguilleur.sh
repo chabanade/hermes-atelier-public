@@ -33,6 +33,7 @@ ART_MAX_MO=${AIG_ART_MAX_MO:-20}                     # taille totale max d'un co
 ART_MAX_FICHIER_MO=${AIG_ART_MAX_FICHIER_MO:-5}      # taille max d'un fichier d'artefact (Mo)
 ROOTGW=${AIG_ROOTGW:-/home/ouvrier/root-gateway.sh}  # sas root : execute (validees) les actions root demandees par l'ouvrier
 HOSTGW=${AIG_HOSTGW:-/home/ouvrier/hostinger-gateway.sh}  # sas Hostinger : actions pare-feu (via API officielle) demandees par l'ouvrier
+CONSIGNES_PATRON=${AIG_CONSIGNES:-/root/.hermes/consignes-patron.txt}  # consignes permanentes de Mehdi, injectees en tete de CHAQUE mission (canal direct patron)
 ETATGW=${AIG_ETATGW:-/home/ouvrier/etat-global.sh}   # genere le tableau de bord permanent (vue d'ensemble) pour Hermes
 ETAT_OUT=${AIG_ETAT_OUT:-/root/.hermes/etat-systeme.md}
 
@@ -169,6 +170,17 @@ for f in "$QUEUE/in/"*; do
   if printf '%s' "$ORDRE" | head -1 | grep -qiE '^@max([[:space:]]|$)'; then
     EFFORT_FLAG="--effort max"
     ORDRE=$(printf '%s' "$ORDRE" | sed '1s/^@max[[:space:]]*//')
+  fi
+
+  # --- CONSIGNES DU PATRON (Mehdi) : injectees en tete de CHAQUE mission ---------
+  #     Mehdi depose ses consignes permanentes dans consignes-patron.txt ; tout
+  #     ouvrier VPS les recoit AVANT sa mission, sans passer par Hermes (canal direct).
+  if [ -s "$CONSIGNES_PATRON" ]; then
+    ORDRE="=== CONSIGNES PERMANENTES DU PATRON (Mehdi) -- a respecter pour CETTE tache ===
+$(cat "$CONSIGNES_PATRON")
+
+=== TA MISSION ===
+$ORDRE"
   fi
 
   log "TRAITE $name (effort: ${EFFORT_FLAG:-xhigh par defaut})"
