@@ -35,3 +35,6 @@ STOP
 STOP.off
 *.tmp
 empty-mcp.json
+
+# dossier genere par les hooks locaux
+sauvegardes-contexte/
