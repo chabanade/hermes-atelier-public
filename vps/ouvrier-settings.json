@@ -1,0 +1,9 @@
+{
+  "model": "opus",
+  "effortLevel": "xhigh",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "node /home/ouvrier/hooks/videur.js", "timeout": 30 } ] }
+    ]
+  }
+}

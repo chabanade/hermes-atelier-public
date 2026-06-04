@@ -1,0 +1,10 @@
+[Unit]
+Description=Garde de nuit -- veille proactive d'Hermes (alertes + briefing Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/ouvrier/garde-nuit.sh check
+# garde-fou : une passe ne doit jamais durer (openssl/curl ont leurs propres timeouts)
+TimeoutStartSec=60

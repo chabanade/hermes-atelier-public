@@ -1,0 +1,33 @@
+{
+  "_commentaire": "Reglages DEDIES a l'ouvrier Claude pilote a distance. A passer via: claude -p \"<ordre>\" --settings C:\\Users\\VOTRE_USER\\claude-relay\\ouvrier-settings.json. Ne s'applique JAMAIS aux sessions normales de Mehdi.",
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\VOTRE_USER\\claude-relay\\hooks\\videur.ps1\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+
+  "_commentaire_permissions": "CEINTURE + BRETELLES : le videur (hook) est le vrai rempart. Ces regles deny sont une 2e couche redondante, au cas ou.",
+  "permissions": {
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git remote:*)",
+      "Bash(rm:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(curl:*)",
+      "Bash(claude:*)",
+      "mcp__claude_ai_AGEA__save_memory",
+      "mcp__claude_ai_AGEA__correct_fact"
+    ]
+  }
+}

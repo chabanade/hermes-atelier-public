@@ -1,0 +1,37 @@
+# ===== Volatile / lourd : jamais versionne =====
+wsl/
+workspace/
+journal/
+_session-backups/
+**/node_modules/
+**/.venv/
+**/__pycache__/
+*.log
+
+# ===== Sauvegardes horodatees : le git EST l'historique desormais =====
+*.bak
+*.bak-*
+*.bak.*
+
+# ===== SECRETS & etats locaux (Loi Zero : JAMAIS dans le depot) =====
+.env
+*.env
+*.key
+*.pem
+*.pfx
+*.p12
+id_ed25519*
+id_rsa*
+*secret*
+*token*
+*.state
+auth.json
+gateway_state.json
+*-tokens/
+.secrets/
+
+# ===== Divers locaux =====
+STOP
+STOP.off
+*.tmp
+empty-mcp.json

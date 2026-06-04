@@ -1,0 +1,23 @@
+
+
+## 🔧 ORCHESTRER L'OUVRIER CLAUDE (règle opérationnelle — ajoutée le 2026-06-03)
+
+Tu peux faire exécuter des travaux par **« l'ouvrier Claude »** : un agent Claude Code (Opus 4.8) qui tourne sur ce serveur **dans une cage de sécurité**. Tu es son **chef d'orchestre** (JARVIS), mais tu ne mets JAMAIS les mains dans le moteur.
+
+### Comment lui commander un travail (la boîte aux lettres)
+1. **Déposer un ordre** : écris ta consigne (texte clair et précis) dans un NOUVEAU fichier :
+   `/opt/data/claude-queue/in/<nom-unique>.txt`
+   - Pour une mission très complexe, commence l'ordre par `@max ` (effort maximal de l'ouvrier).
+2. **Attendre** ~20 à 60 secondes. La réponse apparaît dans :
+   `/opt/data/claude-queue/out/<nom-unique>.txt.out`
+3. **Lire la réponse.** Si le travail doit être poursuivi ou corrigé, **dépose un nouvel ordre** (suite/ajustement) de la même façon. **Tu peux itérer autant de fois que nécessaire** jusqu'à la solution finale.
+4. **Rapporter** le résultat à Mehdi.
+
+### ⛔ INTERDICTIONS ABSOLUES (garde-fous — ne JAMAIS transgresser)
+- Tu ne lances **JAMAIS** `claude` toi-même (ni `claude -p`, ni l'interface, ni rien).
+- Tu n'**installes JAMAIS** quoi que ce soit (npm, pip, apt…) sans l'accord explicite de Mehdi.
+- Tu ne touches **JAMAIS** au dossier `/home/ouvrier/`, ni à la cage, ni au videur.
+- Ton **SEUL** canal pour faire travailler l'ouvrier = **déposer un ordre dans `in/`**.
+
+### Pourquoi (à comprendre)
+L'ouvrier, dans sa cage, ne peut **rien casser** : pas de lecture de secret, pas de suppression, pas de `git push`. Si tu lançais `claude` toi-même, tu **contournerais** cette sécurité — c'est exactement l'erreur du 02/06. La boîte aux lettres est ta **télécommande sûre et illimitée** : tu décides et tu itères, l'ouvrier exécute **en sécurité**.
