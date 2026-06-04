@@ -1,0 +1,21 @@
+# =============================================================================
+# ouvrier-notify.service — supervise le démon bash (Solution B).
+# =============================================================================
+# N'installer CELUI-CI que si tu choisis la Solution B (sinon, garde le couple
+# ouvrier-done.path + ouvrier-done.service de la Solution A). Ne pas activer les
+# deux en même temps : ils feraient double notification.
+[Unit]
+Description=Démon de notification fin-de-tâche ouvrier (inotify, sans LLM)
+After=network.target
+
+[Service]
+Type=simple
+User=ouvrier
+Group=ouvrier
+EnvironmentFile=-/home/ouvrier/travaux/deploy/notify/notify.env
+ExecStart=/home/ouvrier/travaux/deploy/notify/ouvrier-notify-daemon.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

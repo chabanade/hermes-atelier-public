@@ -1,0 +1,1034 @@
+# Phase 2 — Diag + STUN — récapitulatif des modifications
+# Généré le 2026-06-04. Fichiers modifiés : server.py, index.html,
+#   restart.sh, README.md, tests/test_conversation.py.
+# Nouveaux fichiers : DIAGNOSTIC.md (+ ce patch.diff).
+#
+--- a/server.py
++++ b/server.py
+@@ -60,7 +60,13 @@
+ import numpy as np
+ from av.audio.resampler import AudioResampler
+ from aiohttp import web
+-from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
++from aiortc import (
++    MediaStreamTrack,
++    RTCConfiguration,
++    RTCIceServer,
++    RTCPeerConnection,
++    RTCSessionDescription,
++)
+ from aiortc.mediastreams import MediaStreamError
+ 
+ ROOT = Path(__file__).resolve().parent
+@@ -115,11 +121,108 @@
+ OUT_RATE = 48000
+ OUT_FRAME_MS = 20
+ 
++# --------------------------------------------------------------------------- #
++# ICE / STUN — traversée de NAT.
++# Sans STUN, chaque pair n'annonce que ses IP d'interface (« host ») : l'iPhone
++# de Mehdi en 4G/Wi-Fi derrière une box n'offre qu'une IP PRIVÉE (192.168.x.x),
++# que le VPS ne peut JOINDRE. STUN fait découvrir au navigateur son adresse
++# PUBLIQUE vue d'Internet (candidat « srflx », server-reflexive) → la paire
++# VPS↔iPhone devient routable. On configure les DEUX côtés (le serveur reçoit
++# la même liste via /ice) : côté client c'est vital (il est derrière NAT), côté
++# serveur c'est une ceinture-bretelles (utile si le VPS passe un jour en NAT/
++# conteneur).  Réglable par l'env :
++#   • WEBRTC_ICE_SERVERS : soit une liste d'URL séparées par des virgules/espaces
++#     (« stun:host:port turn:host:port »), soit un JSON [{"urls":…,"username":…,
++#     "credential":…}, …] pour porter des identifiants TURN. Vide = AUCUN
++#     serveur ICE (host-only, comportement d'avant la Phase 2).
++#   • WEBRTC_TURN_URL / _USER / _PASS : raccourci pour ajouter UN relais TURN
++#     (utile quand STUN ne suffit pas — NAT symétrique, CGNAT strict).
++DEFAULT_STUN = "stun:stun.l.google.com:19302"
++ICE_SERVERS_ENV = os.environ.get("WEBRTC_ICE_SERVERS", DEFAULT_STUN)
++TURN_URL = os.environ.get("WEBRTC_TURN_URL", "").strip()
++TURN_USER = os.environ.get("WEBRTC_TURN_USER", "").strip()
++TURN_PASS = os.environ.get("WEBRTC_TURN_PASS", "").strip()
++
++# Journalisation : niveau réglable (WEBRTC_LOG_LEVEL=DEBUG pour tout voir).
++# aioice loggue déjà les paires de candidats ICE en INFO — précieux pour le
++# diagnostic NAT — mais c'est verbeux ; WEBRTC_AIOICE_LOG le borne séparément.
++LOG_LEVEL = os.environ.get("WEBRTC_LOG_LEVEL", "INFO").upper()
++AIOICE_LOG_LEVEL = os.environ.get("WEBRTC_AIOICE_LOG", "INFO").upper()
++# Heartbeat média : période (s) du log « N trames reçues » et seuil (s) au-delà
++# duquel on ALERTE « connecté mais 0 trame entrante » (signature d'un échec NAT).
++MEDIA_HEARTBEAT_S = float(os.environ.get("WEBRTC_MEDIA_HEARTBEAT_S", "5"))
++NO_FRAME_WARN_S = float(os.environ.get("WEBRTC_NO_FRAME_WARN_S", "4"))
++
+ logging.basicConfig(
+-    level=logging.INFO,
++    level=getattr(logging, LOG_LEVEL, logging.INFO),
+     format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
+ )
+ log = logging.getLogger("webrtc-vocal")
++logging.getLogger("aioice").setLevel(getattr(logging, AIOICE_LOG_LEVEL, logging.INFO))
++
++
++def build_ice_servers() -> list:
++    """Construit la liste d'RTCIceServer pour aiortc, depuis l'environnement.
++
++    Accepte WEBRTC_ICE_SERVERS en JSON (objets {urls,username,credential}) OU en
++    liste d'URL séparées par virgules/espaces, et ajoute le relais TURN optionnel
++    (WEBRTC_TURN_URL/_USER/_PASS). Renvoie [] si tout est vide (mode host-only).
++    """
++    servers: list = []
++    raw = ICE_SERVERS_ENV.strip()
++    if raw:
++        parsed = None
++        if raw[0] in "[{":
++            try:
++                parsed = json.loads(raw)
++            except json.JSONDecodeError as exc:
++                log.warning("WEBRTC_ICE_SERVERS : JSON illisible (%s) — "
++                            "interprété comme liste d'URL", exc)
++        if isinstance(parsed, dict):
++            parsed = [parsed]
++        if isinstance(parsed, list):
++            for item in parsed:
++                if isinstance(item, str):
++                    servers.append(RTCIceServer(urls=item))
++                elif isinstance(item, dict) and item.get("urls"):
++                    servers.append(RTCIceServer(
++                        urls=item["urls"],
++                        username=item.get("username"),
++                        credential=item.get("credential"),
++                    ))
++        else:  # liste d'URL « a, b c »
++            urls = [u for u in re.split(r"[\s,]+", raw) if u]
++            servers.extend(RTCIceServer(urls=u) for u in urls)
++    if TURN_URL:
++        servers.append(RTCIceServer(
++            urls=TURN_URL,
++            username=TURN_USER or None,
++            credential=TURN_PASS or None,
++        ))
++    return servers
++
++
++def ice_servers_public(servers: list) -> list:
++    """Version JSON-sérialisable de la liste ICE, pour le navigateur (/ice).
++
++    Renvoie des objets {urls, [username], [credential]} consommables tels quels
++    par `new RTCPeerConnection({iceServers: …})`.
++    """
++    out: list = []
++    for s in servers:
++        urls = s.urls if isinstance(s.urls, list) else [s.urls]
++        entry = {"urls": urls}
++        if s.username:
++            entry["username"] = s.username
++        if s.credential:
++            entry["credential"] = s.credential
++        out.append(entry)
++    return out
++
++
++# Liste ICE construite une fois (mêmes serveurs pour le serveur aiortc et, via
++# /ice, pour le navigateur). Recalculée par les tests qui modifient l'env.
++ICE_SERVERS = build_ice_servers()
+ 
+ # Connexions actives — pour une fermeture propre à l'arrêt du serveur.
+ pcs: set[RTCPeerConnection] = set()
+@@ -128,6 +231,40 @@
+ # boucle audio et l'orchestration. Champs : state, speaking, turn, turns[], ...
+ sessions: dict[str, dict] = {}
+ 
++# Compteurs CUMULÉS, à l'échelle du process (survivent à la fin des sessions).
++# Exposés par /diag et /health : permettent de répondre, sans toucher au client,
++# à « est-ce que de l'audio arrive vraiment au serveur ? » (frames_in_total).
++GLOBAL: dict[str, float] = {
++    "sessions_total": 0,     # conversations ouvertes depuis le démarrage
++    "frames_in_total": 0,    # trames micro reçues, toutes sessions confondues
++    "frames_out_total": 0,   # trames de voix d'Hermès émises vers les clients
++    "turns_total": 0,        # tours de parole traités (un par phrase détectée)
++}
++
++
++def new_metrics(now: float) -> dict:
++    """Compteurs d'UNE session. `frames_in` est LA mesure clé du diagnostic :
++    s'il reste à 0 alors que la connexion est « connected », l'audio n'arrive
++    pas (NAT/ICE, firewall UDP, ou micro coupé) — c'est tout l'objet du /diag."""
++    return {
++        "frames_in": 0,          # trames audio brutes reçues du micro (track.recv)
++        "frames_in_drained": 0,  # trames reçues pendant qu'Hermès parlait (ignorées)
++        "samples_in": 0,         # échantillons 16k produits après rééchantillonnage
++        "frames_out": 0,         # trames 20 ms @48k émises (voix d'Hermès)
++        "samples_out": 0,
++        "vad_frames": 0,         # trames d'analyse soumises au VAD
++        "speech_frames": 0,      # ... jugées « voix »
++        "recv_timeouts": 0,      # track.recv() a expiré (flux entrant tari)
++        "max_rms": 0.0,          # plus fort niveau RMS vu (micro muet ⇒ ~0)
++        "started_at": now,
++        "first_frame_at": None,  # horloge monotone de la 1ʳᵉ trame entrante
++        "last_frame_at": None,   # ... de la dernière (fraîcheur du flux)
++        "ice_state": "new",
++        "ice_gathering": "new",
++        "connection_state": "new",
++        "local_candidate_types": [],  # host/srflx/relay vus dans le SDP local
++    }
++
+ # Bornent l'usage CPU (chargement modèle + inférence) sur tout le serveur.
+ _whisper_sem = asyncio.Semaphore(WHISPER_CONCURRENCY)
+ _tts_sem = asyncio.Semaphore(TTS_CONCURRENCY)
+@@ -293,8 +430,13 @@
+     def speaking(self) -> bool:
+         return self._speaking
+ 
+-    def feed(self, frame: np.ndarray, now: float) -> None:
+-        """Ingère une trame d'analyse (longueur frame_samples)."""
++    def feed(self, frame: np.ndarray, now: float) -> bool:
++        """Ingère une trame d'analyse (longueur frame_samples).
++
++        Renvoie la décision du VAD pour CETTE trame (parole = True), ce qui
++        permet à l'appelant de comptabiliser les trames « voix » sans relancer
++        le VAD (silero est coûteux).
++        """
+         sp = self.vad.is_speech(frame)
+         if not self._speaking:
+             self._preroll.append(frame)
+@@ -309,6 +451,7 @@
+             if sp:
+                 self._voiced_ms += self.frame_ms
+                 self._last_voice_at = now
++        return sp
+ 
+     def poll(self, now: float) -> np.ndarray | None:
+         """Renvoie l'audio de la phrase si elle vient de se terminer, sinon None.
+@@ -373,7 +516,7 @@
+ class TTSPlaybackTrack(MediaStreamTrack):
+     kind = "audio"
+ 
+-    def __init__(self):
++    def __init__(self, metrics: dict | None = None):
+         super().__init__()
+         self.rate = OUT_RATE
+         self.frame_samples = int(OUT_RATE * OUT_FRAME_MS / 1000)  # 960
+@@ -384,6 +527,9 @@
+         self._playing = False
+         self._drained = asyncio.Event()
+         self._drained.set()
++        # Métriques de la session : recv() y compte chaque trame ÉMISE (le pair
++        # tire la piste ⇒ le chemin média SORTANT est vivant). None hors session.
++        self._metrics = metrics
+ 
+     async def enqueue(self, samples: np.ndarray) -> None:
+         """Met des échantillons (int16 mono @48k) en file de lecture."""
+@@ -427,6 +573,10 @@
+         frame.pts = self._pts
+         frame.time_base = fractions.Fraction(1, self.rate)
+         self._pts += n
++        if self._metrics is not None:
++            self._metrics["frames_out"] += 1
++            self._metrics["samples_out"] += n
++            GLOBAL["frames_out_total"] += 1
+         return frame
+ 
+ 
+@@ -552,6 +702,7 @@
+     tts: TTSPlaybackTrack = st["tts_track"]
+     tag = st["tag"]
+     turn = st["turn"] = st.get("turn", 0) + 1
++    GLOBAL["turns_total"] += 1
+     ex_id = f"{session[:50]}-t{turn:03d}"  # reste sous 64 car. et anti-collision
+     wav_in = AUDIO_TMP_DIR / f"webrtc_{ex_id}_in.wav"
+     wav_out = AUDIO_TMP_DIR / f"webrtc_{ex_id}_out.wav"
+@@ -623,6 +774,52 @@
+         st["busy"] = False
+ 
+ 
++async def media_watchdog(session: str) -> None:
++    """Surveillant du flux ENTRANT : heartbeat périodique + alerte « 0 trame ».
++
++    Toutes les MEDIA_HEARTBEAT_S, journalise un résumé du flux (frames_in,
++    débit, voix, RMS) tant que la session vit. Surtout : si la connexion est
++    établie mais qu'AUCUNE trame n'arrive après NO_FRAME_WARN_S, il ALERTE —
++    c'est la signature d'un échec de traversée NAT (candidats non routables,
++    faute de STUN) ou d'un firewall UDP, pas d'un bug applicatif. Tâche de fond
++    supervisée, annulée au teardown.
++    """
++    st = sessions.get(session)
++    if st is None:
++        return
++    tag = st["tag"]
++    m: dict = st["metrics"]
++    loop = asyncio.get_running_loop()
++    warned_no_frame = False
++    prev_in = 0
++    live = {"connected", "completed", "checking", "connecting"}
++    while not st.get("ended"):
++        await asyncio.sleep(MEDIA_HEARTBEAT_S)
++        st = sessions.get(session)
++        if st is None or st.get("ended"):
++            break
++        elapsed = loop.time() - m["started_at"]
++        delta = m["frames_in"] - prev_in
++        prev_in = m["frames_in"]
++        if m["frames_in"] == 0:
++            if (not warned_no_frame and elapsed >= NO_FRAME_WARN_S
++                    and m["connection_state"] in live):
++                warned_no_frame = True
++                log.warning("%s ⚠ %.0fs écoulées, connexion=%s mais 0 trame "
++                            "audio ENTRANTE (frames_in=0). Cause probable : "
++                            "traversée NAT échouée (aucun candidat routable — "
++                            "STUN absent/bloqué) ou firewall UDP. Vérifie /ice "
++                            "et les candidats « srflx » côté navigateur.",
++                            tag, elapsed, m["connection_state"])
++        else:
++            warned_no_frame = False
++            log.info("%s média: frames_in=%d (+%d, %.0f/s) voix=%d/%d "
++                     "frames_out=%d max_rms=%.0f état=%s",
++                     tag, m["frames_in"], delta, delta / MEDIA_HEARTBEAT_S,
++                     m["speech_frames"], m["vad_frames"], m["frames_out"],
++                     m["max_rms"], st.get("state"))
++
++
+ async def consume_audio(session: str, track: MediaStreamTrack) -> None:
+     """Boucle d'entrée : rééchantillonne le micro en 16k mono, alimente le VAD et
+     déclenche un tour de parole à chaque fin de phrase. Tourne jusqu'à la fin de
+@@ -632,6 +829,7 @@
+         return
+     tag = st["tag"]
+     ep: Endpointer = st["endpointer"]
++    m: dict = st["metrics"]
+     resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+     carry = np.zeros(0, dtype=np.int16)   # report : reste < une trame d'analyse
+     frame_n = ep.frame_samples
+@@ -643,20 +841,43 @@
+             frame = await asyncio.wait_for(track.recv(), timeout=0.3)
+         except asyncio.TimeoutError:
+             frame = None
++            m["recv_timeouts"] += 1
+         except MediaStreamError:
+             break  # piste terminée (raccrochage)
+ 
+         now = loop.time()
+ 
++        # Instrumentation : toute trame REÇUE compte (preuve que l'audio arrive
++        # vraiment — c'est frames_in qui tranche un éventuel échec NAT/ICE).
++        if frame is not None:
++            m["frames_in"] += 1
++            GLOBAL["frames_in_total"] += 1
++            if m["first_frame_at"] is None:
++                m["first_frame_at"] = now
++                log.info("%s 1ʳᵉ trame micro reçue (%.2fs après l'ouverture) — "
++                         "le flux audio ENTRANT est établi",
++                         tag, now - m["started_at"])
++            m["last_frame_at"] = now
++
+         # Pendant qu'Hermès parle/réfléchit : on draine le micro sans l'écouter.
+         if st.get("busy"):
++            if frame is not None:
++                m["frames_in_drained"] += 1
+             continue
+ 
+         if frame is not None:
+             for rf in resampler.resample(frame):
+                 carry = np.concatenate([carry, rf.to_ndarray().reshape(-1)])
+             while len(carry) >= frame_n:
+-                ep.feed(carry[:frame_n].astype(np.int16), now)
++                chunk = carry[:frame_n].astype(np.int16)
++                rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
++                if rms > m["max_rms"]:
++                    m["max_rms"] = rms
++                sp = ep.feed(chunk, now)
++                m["vad_frames"] += 1
++                m["samples_in"] += frame_n
++                if sp:
++                    m["speech_frames"] += 1
+                 carry = carry[frame_n:]
+             st["state"] = "speech" if ep.speaking else "listening"
+ 
+@@ -666,7 +887,8 @@
+             carry = np.zeros(0, dtype=np.int16)
+             _supervise(asyncio.create_task(handle_turn(session, utt)), session)
+ 
+-    log.info("%s fin d'écoute du micro", tag)
++    log.info("%s fin d'écoute du micro (frames_in=%d, voix=%d trames, max_rms=%.0f)",
++             tag, m["frames_in"], m["speech_frames"], m["max_rms"])
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -677,6 +899,30 @@
+     return web.Response(content_type="text/html", text=html)
+ 
+ 
++def _candidate_summary(sdp: str) -> tuple[list[str], list[str]]:
++    """Extrait du SDP les candidats ICE : (types, libellés lisibles).
++
++    types = ['host', 'srflx', …] (un par candidat). Un « srflx » (server-
++    reflexive) prouve que STUN a répondu : l'adresse PUBLIQUE a été découverte —
++    c'est exactement ce qui manque, faute de STUN, au navigateur derrière NAT.
++    """
++    types: list[str] = []
++    labels: list[str] = []
++    for line in sdp.splitlines():
++        line = line.strip()
++        if "candidate:" not in line or " typ " not in line:
++            continue
++        parts = line.split()
++        try:
++            ip, port = parts[4], parts[5]
++            typ = parts[parts.index("typ") + 1]
++        except (ValueError, IndexError):
++            continue
++        types.append(typ)
++        labels.append(f"{typ} {ip}:{port}")
++    return types, labels
++
++
+ async def offer(request: web.Request) -> web.Response:
+     """Signalisation : reçoit l'offre SDP + session_id, met en place les pistes
+     entrante (micro) et sortante (voix d'Hermès), renvoie l'answer SDP."""
+@@ -686,12 +932,16 @@
+         return web.json_response({"error": "session_id invalide ou manquant"}, status=400)
+ 
+     offer_sdp = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+-    pc = RTCPeerConnection()
++    # STUN/TURN : mêmes serveurs ICE que ceux annoncés au navigateur via /ice.
++    pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ICE_SERVERS))
+     pcs.add(pc)
+     tag = f"[{session[:8]} {request.remote}]"
+-    log.info("%s nouvelle conversation", tag)
++    now = asyncio.get_running_loop().time()
++    GLOBAL["sessions_total"] += 1
++    log.info("%s nouvelle conversation (ICE: %d serveur(s))", tag, len(ICE_SERVERS))
+ 
+-    tts_track = TTSPlaybackTrack()
++    metrics = new_metrics(now)
++    tts_track = TTSPlaybackTrack(metrics)
+     pc.addTrack(tts_track)  # piste sortante : la voix d'Hermès
+     sessions[session] = {
+         "tag": tag,
+@@ -703,19 +953,39 @@
+         "tts_track": tts_track,
+         "endpointer": Endpointer(make_vad()),
+         "tasks": set(),
++        "metrics": metrics,
++        "remote": request.remote,
+     }
++    st = sessions[session]
+ 
+     @pc.on("connectionstatechange")
+     async def on_connectionstatechange() -> None:
++        metrics["connection_state"] = pc.connectionState
+         log.info("%s état -> %s", tag, pc.connectionState)
+         if pc.connectionState in ("failed", "closed"):
+             await teardown(session, pc)
+ 
++    @pc.on("iceconnectionstatechange")
++    async def on_iceconnectionstatechange() -> None:
++        metrics["ice_state"] = pc.iceConnectionState
++        log.info("%s ICE -> %s", tag, pc.iceConnectionState)
++        if pc.iceConnectionState == "failed":
++            log.warning("%s ⚠ ICE a ÉCHOUÉ : aucune paire de candidats routable. "
++                        "Sans STUN, le navigateur n'offre qu'une IP privée que le "
++                        "VPS ne peut joindre — active STUN (/ice) ou un relais TURN.",
++                        tag)
++
++    @pc.on("icegatheringstatechange")
++    async def on_icegatheringstatechange() -> None:
++        metrics["ice_gathering"] = pc.iceGatheringState
++        log.debug("%s ICE gathering -> %s", tag, pc.iceGatheringState)
++
+     @pc.on("track")
+     def on_track(track) -> None:
+         log.info("%s piste reçue : %s", tag, track.kind)
+         if track.kind == "audio":
+             _supervise(asyncio.ensure_future(consume_audio(session, track)), session)
++            _supervise(asyncio.ensure_future(media_watchdog(session)), session)
+ 
+         @track.on("ended")
+         async def on_ended() -> None:
+@@ -724,7 +994,14 @@
+     await pc.setRemoteDescription(offer_sdp)
+     answer = await pc.createAnswer()
+     await pc.setLocalDescription(answer)
+-    sessions[session]["state"] = "listening"
++
++    # Candidats ICE LOCAUX (côté serveur), pour le diagnostic NAT : on voit ici
++    # les IP que le VPS annonce (publique = bon ; bridges Docker 172.x = bruit).
++    ctypes, clabels = _candidate_summary(pc.localDescription.sdp)
++    metrics["local_candidate_types"] = ctypes
++    log.info("%s candidats ICE locaux : %s", tag, ", ".join(clabels) or "aucun")
++
++    st["state"] = "listening"
+     log.info("%s answer envoyée — conversation ouverte", tag)
+     return web.json_response(
+         {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "session": session}
+@@ -765,18 +1042,85 @@
+          "reply": t.get("reply"), "state": t.get("state")}
+         for t in st.get("turns", [])
+     ]
++    m = st.get("metrics", {})
+     return web.json_response({
+         "status": st.get("state", "listening"),
+         "speaking": bool(st.get("speaking")),
+         "turn": st.get("turn", 0),
+         "turns": turns,
+         "error": st.get("last_error"),
++        # Instrumentation légère pour le client (le détail complet est sur /diag).
++        "frames_in": m.get("frames_in", 0),
++        "frames_out": m.get("frames_out", 0),
++        "ice_state": m.get("ice_state"),
++        "connection_state": m.get("connection_state"),
+     })
+ 
+ 
+ async def health(request: web.Request) -> web.Response:
+     return web.json_response({"ok": True, "service": "webrtc-vocal", "mode": "conversation",
+-                              "sessions": len(sessions)})
++                              "sessions": len(sessions),
++                              "ice_servers": len(ICE_SERVERS),
++                              "frames_in_total": GLOBAL["frames_in_total"]})
++
++
++async def ice_config(request: web.Request) -> web.Response:
++    """Serveurs ICE (STUN/TURN) à passer à RTCPeerConnection côté navigateur.
++
++    Le client récupère cette liste AVANT de créer la connexion : la config STUN
++    a ainsi une SEULE source de vérité (le serveur, via WEBRTC_ICE_SERVERS), et
++    s'aligne sur celle du serveur aiortc.
++    """
++    return web.json_response({"iceServers": ice_servers_public(ICE_SERVERS)})
++
++
++async def diag(request: web.Request) -> web.Response:
++    """Vue DIAGNOSTIC complète (JSON) : compteurs cumulés du process, config ICE
++    effective, et l'état média de chaque session — au premier rang `frames_in`
++    (« l'audio arrive-t-il vraiment ? »). Sert de tableau de bord à DIAGNOSTIC.md.
++    """
++    now = asyncio.get_running_loop().time()
++    sess: dict[str, dict] = {}
++    for sid, st in sessions.items():
++        m = st.get("metrics", {})
++        last = m.get("last_frame_at")
++        started = m.get("started_at")
++        sess[sid[:8]] = {
++            "state": st.get("state"),
++            "speaking": bool(st.get("speaking")),
++            "busy": bool(st.get("busy")),
++            "turn": st.get("turn", 0),
++            "remote": st.get("remote"),
++            "connection_state": m.get("connection_state"),
++            "ice_state": m.get("ice_state"),
++            "ice_gathering": m.get("ice_gathering"),
++            "local_candidate_types": m.get("local_candidate_types"),
++            "frames_in": m.get("frames_in", 0),
++            "frames_in_drained": m.get("frames_in_drained", 0),
++            "frames_out": m.get("frames_out", 0),
++            "samples_in": m.get("samples_in", 0),
++            "samples_out": m.get("samples_out", 0),
++            "vad_frames": m.get("vad_frames", 0),
++            "speech_frames": m.get("speech_frames", 0),
++            "recv_timeouts": m.get("recv_timeouts", 0),
++            "max_rms": round(m.get("max_rms", 0.0), 1),
++            "uptime_s": round(now - started, 1) if started is not None else None,
++            "since_last_frame_s": round(now - last, 1) if last is not None else None,
++        }
++    return web.json_response({
++        "service": "webrtc-vocal",
++        "global": GLOBAL,
++        "ice_servers": ice_servers_public(ICE_SERVERS),
++        "config": {
++            "vad_backend": VAD_BACKEND,
++            "end_silence_ms": END_SILENCE_MS,
++            "min_speech_ms": MIN_SPEECH_MS,
++            "media_heartbeat_s": MEDIA_HEARTBEAT_S,
++            "no_frame_warn_s": NO_FRAME_WARN_S,
++            "log_level": LOG_LEVEL,
++        },
++        "sessions": sess,
++    })
+ 
+ 
+ async def on_shutdown(app: web.Application) -> None:
+@@ -794,6 +1138,8 @@
+     app.router.add_post("/offer", offer)
+     app.router.add_get("/poll", poll)
+     app.router.add_get("/health", health)
++    app.router.add_get("/ice", ice_config)
++    app.router.add_get("/diag", diag)
+     return app
+ 
+ 
+@@ -956,6 +1302,15 @@
+     log.info("  TTS=%s voix=%s via %s", TTS_SCRIPT.name, Path(PIPER_VOICE).name, TTS_PYTHON)
+     log.info("  VAD=%s  fin_de_phrase=%dms  min_parole=%dms",
+              VAD_BACKEND, END_SILENCE_MS, MIN_SPEECH_MS)
++    if ICE_SERVERS:
++        log.info("  ICE=%s  (STUN/TURN — traversée NAT ; mêmes serveurs via /ice)",
++                 ", ".join(", ".join(s.urls) if isinstance(s.urls, list) else s.urls
++                           for s in ICE_SERVERS))
++    else:
++        log.warning("  ICE=AUCUN (host-only) — un client derrière NAT échouera ; "
++                    "définis WEBRTC_ICE_SERVERS (défaut conseillé : %s)", DEFAULT_STUN)
++    log.info("  log=%s  heartbeat_média=%.0fs  alerte_0_trame=%.0fs",
++             LOG_LEVEL, MEDIA_HEARTBEAT_S, NO_FRAME_WARN_S)
+     # Garde-fou : STT/TTS doivent être opérationnels AVANT d'ouvrir le port.
+     preflight()
+     if _tls_on:
+--- a/index.html
++++ b/index.html
+@@ -102,18 +102,57 @@
+     }
+ 
+     // aiortc ne fait pas de trickle ICE : on attend la fin du gathering avant
+-    // d'envoyer l'offre (les candidats sont inclus dans le SDP).
+-    function waitIceComplete(pc){
++    // d'envoyer l'offre (les candidats sont inclus dans le SDP). Plafond de
++    // sécurité : si STUN tarde ou est bloqué, on n'attend pas indéfiniment — on
++    // part avec les candidats déjà récoltés (mieux vaut une offre partielle
++    // qu'une page figée).
++    function waitIceComplete(pc, timeoutMs = 4000){
+       if (pc.iceGatheringState === 'complete') return Promise.resolve();
+       return new Promise(res => {
+-        const check = () => {
+-          if (pc.iceGatheringState === 'complete') {
+-            pc.removeEventListener('icegatheringstatechange', check);
+-            res();
+-          }
++        let done = false;
++        const finish = () => {
++          if (done) return; done = true;
++          pc.removeEventListener('icegatheringstatechange', check); res();
+         };
++        const check = () => { if (pc.iceGatheringState === 'complete') finish(); };
+         pc.addEventListener('icegatheringstatechange', check);
++        setTimeout(() => { if (!done) {
++          log('⚠ gathering ICE > ' + timeoutMs + 'ms — envoi avec les candidats dispo');
++          finish();
++        } }, timeoutMs);
++      });
++    }
++
++    // Récupère la config STUN/TURN du serveur (source UNIQUE de vérité : elle est
++    // alignée sur celle du serveur aiortc, pilotée par WEBRTC_ICE_SERVERS).
++    async function fetchIceServers(){
++      try {
++        const r = await fetch('/ice');
++        if (!r.ok) throw new Error('HTTP ' + r.status);
++        const list = (await r.json()).iceServers || [];
++        log('config ICE : ' + (list.length
++          ? list.map(s => Array.isArray(s.urls) ? s.urls.join('/') : s.urls).join(', ')
++          : 'aucune (host-only)'));
++        return list;
++      } catch (e) {
++        log('⚠ /ice indisponible (' + e.message + ') — repli STUN Google');
++        return [{ urls: 'stun:stun.l.google.com:19302' }];
++      }
++    }
++
++    // Récapitule les candidats ICE récoltés (host/srflx/relay) depuis le SDP, et
++    // PRÉVIENT si aucun « srflx » : c'est le signe que STUN n'a rien renvoyé —
++    // derrière un NAT (4G, box), la connexion risque alors d'échouer.
++    function logCandidateTypes(sdp){
++      const types = {};
++      (sdp.match(/ typ (\w+)/g) || []).forEach(m => {
++        const t = m.trim().split(' ')[1]; types[t] = (types[t] || 0) + 1;
+       });
++      const summary = Object.entries(types).map(([k, v]) => k + '×' + v).join(', ');
++      log('candidats ICE locaux : ' + (summary || 'aucun'));
++      if (!types.srflx && !types.relay)
++        log('⚠ aucun candidat « srflx » : STUN muet/bloqué. Derrière un NAT, ' +
++            'la connexion peut échouer (vois DIAGNOSTIC.md).');
+     }
+ 
+     async function start(){
+@@ -130,7 +169,8 @@
+         });
+         log('micro OK — session ' + session.slice(0,8));
+ 
+-        pc = new RTCPeerConnection();
++        const iceServers = await fetchIceServers();   // STUN/TURN fournis par le serveur
++        pc = new RTCPeerConnection({ iceServers });
+         pc._localStream = stream;
+ 
+         // Voix d'Hermès entrante -> élément <audio> (lecture auto).
+@@ -139,6 +179,10 @@
+           if (ev.track.kind === 'audio') botAudio.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+         });
+ 
++        // Traçage ICE : indispensable pour diagnostiquer un échec de connexion.
++        pc.addEventListener('iceconnectionstatechange', () => log('ICE: ' + pc.iceConnectionState));
++        pc.addEventListener('icegatheringstatechange', () => log('ICE gathering: ' + pc.iceGatheringState));
++
+         pc.addEventListener('connectionstatechange', () => {
+           log('connection: ' + pc.connectionState);
+           if (pc.connectionState === 'connected') setStatus('🎧 À votre écoute', 'listen');
+@@ -153,6 +197,7 @@
+         setStatus('Négociation…', 'warn');
+         await pc.setLocalDescription(await pc.createOffer());
+         await waitIceComplete(pc);
++        logCandidateTypes(pc.localDescription.sdp);
+         log('offre SDP prête, envoi à /offer');
+ 
+         const resp = await fetch('/offer', {
+--- a/restart.sh
++++ b/restart.sh
+@@ -19,6 +19,9 @@
+ #   WEBRTC_DATA_DIR  racine inbox/outbox (défaut ./data ; À PARTAGER avec webrtc-reply.sh)
+ #   HF_HOME          cache du modèle whisper (défaut ./models/hf)
+ #   WEBRTC_VAD       backend VAD : auto|silero|webrtcvad|energy (défaut auto)
++#   WEBRTC_ICE_SERVERS  serveurs STUN/TURN (défaut STUN Google ; vide = host-only —
++#                       un client derrière NAT échouera). cf. /ice et DIAGNOSTIC.md
++#   WEBRTC_LOG_LEVEL    niveau de log applicatif (défaut INFO ; DEBUG pour tout voir)
+ set -euo pipefail
+ cd "$(dirname "$0")"
+ 
+@@ -44,6 +47,12 @@
+ # ligne le temps du premier download, puis la remettre.
+ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+ 
++# Traversée de NAT : STUN activé par défaut (indispensable pour un client distant
++# derrière une box/4G — sinon il n'annonce qu'une IP privée injoignable). Mêmes
++# serveurs côté serveur aiortc ET navigateur (via /ice). Vider pour du host-only.
++export WEBRTC_ICE_SERVERS="${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}"
++export WEBRTC_LOG_LEVEL="${WEBRTC_LOG_LEVEL:-INFO}"
++
+ # 1. Stopper l'ancienne instance si elle tourne encore.
+ if [[ -f "$PIDFILE" ]]; then
+   old="$(cat "$PIDFILE" 2>/dev/null || true)"
+--- a/README.md
++++ b/README.md
+@@ -107,11 +107,19 @@
+ |---------|----------------------|-----------------------------------------------------------------|
+ | `GET`   | `/`                  | page web (conversation continue)                                |
+ | `POST`  | `/offer`             | signalisation WebRTC ; corps inclut `session` ; pistes micro↑ + voix↓ |
+-| `GET`   | `/poll?session=<id>` | état conversation : `{status, speaking, turn, turns[]}`         |
+-| `GET`   | `/health`            | sonde de vivacité                                               |
++| `GET`   | `/poll?session=<id>` | état conversation : `{status, speaking, turn, turns[], frames_in, …}` |
++| `GET`   | `/ice`               | serveurs ICE (STUN/TURN) servis au navigateur : `{iceServers:[…]}` |
++| `GET`   | `/diag`              | diagnostic JSON : compteurs cumulés + métriques par session (`frames_in`…) |
++| `GET`   | `/health`            | sonde de vivacité (+ `sessions`, `ice_servers`, `frames_in_total`) |
+ 
+ `status ∈ listening | speech | transcribing | thinking | speaking | ended | unknown`
+ 
++> **Diagnostiquer un silence** (« je parle, c'est connecté, mais rien »). Le
++> compteur **`frames_in`** (via `/diag` ou `/poll`) dit si l'audio arrive
++> réellement au serveur ; **STUN** (activé par défaut, cf. `/ice`) corrige la
++> cause n°1 d'un échec à distance — la traversée de NAT. Démarche complète,
++> arbre de décision et escalade TURN dans **`DIAGNOSTIC.md`**.
++
+ ## Configuration (variables d'environnement)
+ 
+ | Variable               | Défaut                                              | Rôle                                   |
+@@ -137,6 +145,13 @@
+ | `WEBRTC_TLS_CERT`      | _(vide)_                                            | certificat PEM ⇒ active le HTTPS natif |
+ | `WEBRTC_TLS_KEY`       | _(vide)_                                            | clé privée PEM (avec `WEBRTC_TLS_CERT`)|
+ | `WEBRTC_HTTPS_PORT`    | `8443`                                              | port HTTPS natif (si certificat fourni)|
++| `WEBRTC_ICE_SERVERS`   | `stun:stun.l.google.com:19302`                      | serveurs ICE (liste d'URL, ou JSON `[{urls,username,credential}]`) ; **vide = host-only** |
++| `WEBRTC_TURN_URL`      | _(vide)_                                            | relais TURN optionnel (avec `_USER`/`_PASS`) si STUN ne suffit pas |
++| `WEBRTC_TURN_USER` / `_PASS` | _(vide)_                                      | identifiants du relais TURN            |
++| `WEBRTC_LOG_LEVEL`     | `INFO`                                              | niveau du logger applicatif (`DEBUG`…) |
++| `WEBRTC_AIOICE_LOG`    | `INFO`                                              | niveau du logger ICE (`WARNING` = moins de bruit) |
++| `WEBRTC_MEDIA_HEARTBEAT_S` | `5`                                             | période du heartbeat média (logs)      |
++| `WEBRTC_NO_FRAME_WARN_S`   | `4`                                             | délai avant l'alerte « 0 trame entrante » |
+ 
+ ## Lancer en local (dev)
+ 
+--- a/tests/test_conversation.py
++++ b/tests/test_conversation.py
+@@ -12,6 +12,10 @@
+       ──▶ /poll : le tour passe à done, transcript + reply          [assert]
+   puis on RECOMMENCE un 2ᵉ tour pour prouver que le VAD se réarme.
+ 
++Phase 2 (diag + STUN) : on vérifie aussi /ice (config ICE servie au navigateur,
++host-only en boucle locale) et /diag (compteurs), dont `frames_in` qui prouve que
++l'audio est bien REÇU côté serveur — la mesure clé du diagnostic « 0 trame ».
++
+ Aucune dépendance à faster-whisper ni à Piper : STT et TTS sont remplacés par
+ tests/transcribe_fake.py et tests/synth_fake.py (mêmes contrats), branchés via
+ WHISPER_SCRIPT / TTS_SCRIPT. VAD forcé sur l'énergie (déterministe).
+@@ -75,6 +79,11 @@
+         PREROLL_MS="150",
+         TAIL_SILENCE_MS="100",
+         HERMES_TIMEOUT_S="15",
++        # Phase 2 : boucle locale (127.0.0.1) ⇒ host-only, AUCUN serveur ICE
++        # (déterministe + pas d'attente STUN vers Internet). Heartbeat média
++        # raccourci pour exercer le surveillant pendant le test.
++        WEBRTC_ICE_SERVERS="",
++        WEBRTC_MEDIA_HEARTBEAT_S="1",
+     )
+ 
+     sys.path.insert(0, str(PROJECT))
+@@ -230,7 +239,29 @@
+                     timeout=10)
+                 print("  ✓ retour à l'écoute (VAD réarmé)")
+ 
++            # 7. Instrumentation Phase 2 : /ice expose la config (host-only ici),
++            #    /diag les compteurs, et frames_in PROUVE que l'audio est arrivé.
++            async with http.get(f"{base}/ice") as r:
++                ice = await r.json()
++            assert ice.get("iceServers") == [], f"host-only attendu, vu {ice}"
++            async with http.get(f"{base}/diag") as r:
++                dg = await r.json()
++            sk = session_id[:8]
++            assert sk in dg["sessions"], f"/diag sans la session : {list(dg['sessions'])}"
++            sd = dg["sessions"][sk]
++            assert sd["frames_in"] > 0, f"frames_in devrait être > 0, vu {sd['frames_in']}"
++            assert sd["frames_out"] > 0, f"frames_out devrait être > 0, vu {sd['frames_out']}"
++            assert dg["global"]["frames_in_total"] >= sd["frames_in"]
++            assert dg["global"]["turns_total"] >= 2
++            async with http.get(f"{base}/poll", params={"session": session_id}) as r:
++                pj = await r.json()
++            assert "frames_in" in pj, "/poll devrait exposer frames_in"
++            print(f"  ✓ /ice host-only ; /diag frames_in={sd['frames_in']} "
++                  f"frames_out={sd['frames_out']} voix={sd['speech_frames']} "
++                  f"max_rms={sd['max_rms']} ; /poll.frames_in={pj['frames_in']}")
++
+             print("\n✅ CONVERSATION VALIDÉE : 2 tours parole→STT→inbox→Hermès→TTS→audio")
++            print("✅ INSTRUMENTATION VALIDÉE : /ice + /diag + frames_in (Phase 2)")
+             rc = 0
+     except AssertionError as exc:
+         print(f"\n❌ ÉCHEC : {exc}")
+--- /dev/null
++++ b/DIAGNOSTIC.md
+@@ -0,0 +1,247 @@
++# DIAGNOSTIC — WebRTC Vocal (Phase 2 : instrumentation + STUN)
++
++Guide pour répondre à **une seule** question, la plus fréquente : *« je clique
++Démarrer, la page dit “connecté”, je parle… et rien »*. Avant la Phase 2 on ne
++savait pas **où** la chaîne se cassait. Maintenant si : un compteur **`frames_in`**
++dit si l'audio arrive vraiment au serveur, et **STUN** corrige la cause n°1 d'un
++silence total à distance (la traversée de NAT).
++
++La chaîne complète :
++
++```
++micro navigateur ──[A] WebRTC/NAT──▶ serveur reçoit des trames ──[B] VAD/endpointing
++   ──[C] STT ──[D] inbox→Hermès→outbox ──[E] TTS ──[F] piste sortante──▶ oreillette
++```
++
++`frames_in` isole **[A]** (le plus opaque) du reste : tant qu'il vaut 0, inutile
++de soupçonner le STT, Hermès ou Piper — **aucun son n'entre**.
++
++---
++
++## 1. Le réflexe : lire `/diag`
++
++Tout est dans un seul endpoint JSON. Depuis l'hôte du VPS :
++
++```bash
++curl -fsS http://127.0.0.1:8686/diag | python3 -m json.tool
++```
++
++Exemple (une conversation en cours, saine) :
++
++```json
++{
++  "global": { "sessions_total": 3, "frames_in_total": 12450,
++              "frames_out_total": 18020, "turns_total": 5 },
++  "ice_servers": [ { "urls": ["stun:stun.l.google.com:19302"] } ],
++  "config": { "vad_backend": "auto", "end_silence_ms": 800,
++              "media_heartbeat_s": 5.0, "no_frame_warn_s": 4.0, "log_level": "INFO" },
++  "sessions": {
++    "a8e5484d": {
++      "state": "listening", "connection_state": "connected", "ice_state": "completed",
++      "local_candidate_types": ["host", "host", "srflx"],
++      "frames_in": 1530, "frames_out": 2050, "samples_in": 489600,
++      "vad_frames": 1020, "speech_frames": 240, "recv_timeouts": 2,
++      "max_rms": 3120.0, "uptime_s": 31.2, "since_last_frame_s": 0.1
++    }
++  }
++}
++```
++
++**Les trois chiffres qui tranchent**, par session :
++
++| Champ | Sain | Ce que ça veut dire si anormal |
++|---|---|---|
++| `frames_in` | **monte** (≈50/s en parlant) | **0 ⇒ aucun audio n'entre** : voir §2 (NAT/STUN, firewall, micro). |
++| `max_rms` | quelques centaines à quelques milliers | **~0 alors que `frames_in` monte** : audio reçu mais **muet** (micro coupé/mauvais ⇒ STT vide). |
++| `speech_frames` | > 0 quand on parle | **0 alors que `max_rms` est haut** : le VAD ne déclenche pas (seuil/agressivité — voir §4). |
++
++Raccourci ultra-rapide sans tout l'objet :
++
++```bash
++curl -fsS http://127.0.0.1:8686/health    # {"ok":true,"sessions":1,"ice_servers":1,"frames_in_total":1530}
++```
++
++`/poll?session=<id>` (déjà consommé par la page) porte aussi `frames_in`,
++`frames_out`, `ice_state`, `connection_state` — pratique côté navigateur.
++
++---
++
++## 2. `frames_in` reste à 0 : c'est (presque toujours) la traversée de NAT
++
++C'était LE piège du serveur d'origine. **Symptôme** : `connection_state` finit à
++`failed` (ou reste `connecting`), `frames_in` ne décolle jamais, et le log porte :
++
++```
++[a8e5484d 1.2.3.4] ⚠ 4s écoulées, connexion=connecting mais 0 trame audio ENTRANTE
++   (frames_in=0). Cause probable : traversée NAT échouée … STUN absent/bloqué …
++```
++
++### Pourquoi (le fond)
++
++WebRTC essaie des **paires de candidats** (mon adresse → ton adresse) jusqu'à en
++trouver une routable. Sans STUN, le navigateur de Mehdi (iPhone en 4G, ou Wi-Fi
++derrière la box) n'annonce que son **IP privée** :
++
++```
++serveur VOTRE_IP_VPS  ──▶  client 192.168.1.55   ❌ injoignable (derrière NAT)
++```
++
++`192.168.1.55` n'existe pas sur Internet : le VPS ne peut pas y envoyer de paquet.
++**STUN** fait découvrir au navigateur son **adresse publique** vue d'Internet (un
++candidat de type **`srflx`**, *server-reflexive*) :
++
++```
++serveur VOTRE_IP_VPS  ──▶  client 88.120.x.y:51234 (srflx)   ✅ routable
++```
++
++> **Lecture historique** (logs avant Phase 2) : la connexion ne « marchait » que
++> par chance, quand **les deux** pairs avaient une IPv6 publique routable
++> (`2a02:… → 2a01:…` SUCCEEDED). En IPv4-seul, l'unique paire était
++> `VOTRE_IP_VPS → 192.168.1.55` (privée) + des bridges Docker `172.x` inutiles :
++> aucune routable ⇒ silence total. STUN supprime cette dépendance à la chance.
++
++### Le verdict en une ligne
++
++Dans les **logs du navigateur** (zone noire en bas de la page) après « Démarrer » :
++
++```
++candidats ICE locaux : host×2, srflx×1      ✅ STUN a marché
++candidats ICE locaux : host×2               ⚠ aucun srflx → NAT non traversé
++```
++
++Côté **serveur**, `/diag` → `local_candidate_types` montre les candidats du VPS
++(le `host` public suffit côté serveur — il n'est pas derrière NAT ; c'est le
++**navigateur** qui a besoin du `srflx`).
++
++### Les correctifs (par ordre)
++
++1. **STUN activé ?** `curl …/ice` doit renvoyer au moins un serveur :
++   ```bash
++   curl -fsS http://127.0.0.1:8686/ice   # {"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]}
++   ```
++   Si `{"iceServers":[]}` ⇒ `WEBRTC_ICE_SERVERS` est vide. Mettre (défaut conseillé) :
++   ```bash
++   WEBRTC_ICE_SERVERS="stun:stun.l.google.com:19302" ./restart.sh
++   ```
++2. **Firewall UDP.** STUN/ICE utilisent l'**UDP**. Le port média est éphémère et
++   sortant côté serveur (aiortc), mais un firewall qui bloque l'UDP sortant
++   casse tout. Sur le VPS, autoriser l'UDP sortant ; Hostinger hPanel ▸ Firewall.
++3. **STUN ne suffit pas (NAT symétrique / CGNAT strict).** Rare mais réel : même
++   avec un `srflx`, la paire échoue. Il faut alors **relayer** le média par un
++   serveur **TURN** (le seul qui marche à 100 %, car le trafic transite par lui) :
++   ```bash
++   WEBRTC_TURN_URL="turn:turn.example.net:3478" \
++   WEBRTC_TURN_USER="user" WEBRTC_TURN_PASS="secret" ./restart.sh
++   ```
++   `/ice` annoncera alors aussi ce TURN au navigateur. (Monter un coturn dépasse
++   ce dépôt ; à prévoir si des clients restent injoignables malgré STUN.)
++
++---
++
++## 3. `frames_in` monte mais Hermès reste muet : c'est en aval
++
++L'audio **entre** bien ([A] OK). Le `frames_in=… (+N, …/s)` du heartbeat le
++prouve. On descend la chaîne :
++
++| Observation (logs / `/diag`) | Étape | Action |
++|---|---|---|
++| `max_rms` ~0 malgré `frames_in` qui monte | micro muet | vérifier le micro/la permission ; tester un autre appareil |
++| `speech_frames`=0 alors que `max_rms` est haut | VAD ne déclenche pas | §4 (seuils VAD) |
++| log `transcription VIDE (…s d'audio capté…)` | STT [C] | micro faible/bruité ; essayer `WHISPER_MODEL=small` |
++| `transcription '…'` OK mais **aucune** outbox | pont Hermès [D] | démon non lancé ou **`WEBRTC_DATA_DIR` différent** entre serveur et démon |
++| `reply.log` : `hermes: command not found` | cerveau Hermès | corriger `HERMES_BIN` ou passer en `HERMES_URL=http://…` |
++| `pas de réponse Hermès (timeout)` | [D] lent | augmenter `HERMES_TIMEOUT_S` ; vérifier le LLM |
++| `frames_out` reste à 0 pendant `speaking` | TTS/piste [E][F] | échec Piper (voir log `TTS[stderr]`) ; voix `.onnx` présente ? |
++
++> Ce tableau prolonge celui du **RUNBOOK** (« je parle mais aucune réponse ») : la
++> nouveauté Phase 2 est qu'on sait désormais **distinguer** [A] (NAT) du reste,
++> au lieu de tout soupçonner.
++
++---
++
++## 4. VAD qui ne déclenche pas (`speech_frames`=0)
++
++Si `max_rms` est franc (centaines/milliers) mais `speech_frames` reste à 0, le
++VAD juge tout « silence ». Leviers (puis `./restart.sh`) :
++
++```bash
++WEBRTC_VAD=webrtcvad VAD_AGGRESSIVENESS=1   # 0=permissif … 3=strict
++# ou, en repli énergie, baisser le seuil RMS :
++WEBRTC_VAD=energy VAD_ENERGY_THRESHOLD=300
++```
++
++Inversement, si Hermès se déclenche sur du bruit, **monter** l'agressivité / le
++seuil. `MIN_SPEECH_MS` rejette les phrases trop courtes (toux) ; `END_SILENCE_MS`
++règle le délai de silence qui marque la fin de phrase.
++
++---
++
++## 5. Logs : ce qui est nouveau et comment les lire
++
++Journalisation enrichie (toujours dans `logs/server.log`) :
++
++- **Au démarrage** — la bannière ajoute la ligne `ICE=…` (serveurs STUN/TURN
++  effectifs) et `log=… heartbeat_média=…`. Si `ICE=AUCUN`, un **WARNING** prévient
++  qu'un client derrière NAT échouera.
++- **À l'ouverture d'une session** — `candidats ICE locaux : …` (les IP que le VPS
++  annonce) et, transition par transition, `ICE -> checking/connected/completed`
++  (`failed` ⇒ WARNING explicite).
++- **1ʳᵉ trame** — `1ʳᵉ trame micro reçue (0.42s après l'ouverture)` : le flux
++  entrant est établi. Si cette ligne n'apparaît jamais ⇒ §2.
++- **Heartbeat média** — toutes les `WEBRTC_MEDIA_HEARTBEAT_S` (défaut 5 s) :
++  ```
++  média: frames_in=445 (+50, 50/s) voix=69/105 frames_out=449 max_rms=4547 état=listening
++  ```
++  `+N/…s` = débit instantané (≈50 trames/s en parlant). `0/s` durablement en
++  pleine parole ⇒ le flux s'est tari.
++- **Alerte 0 trame** — le WARNING `… 0 trame audio ENTRANTE …` après
++  `WEBRTC_NO_FRAME_WARN_S` (défaut 4 s) si connecté sans aucune trame.
++- **aioice** — les paires de candidats ICE (`CandidatePair(... ) State…SUCCEEDED`,
++  `ICE completed`) restent loggées par la lib : **c'est là qu'on voit la paire
++  RETENUE** (l'API n'expose pas proprement la paire « gagnante », d'où ce renvoi).
++  Trop verbeux ? `WEBRTC_AIOICE_LOG=WARNING`. Besoin de tout voir ?
++  `WEBRTC_LOG_LEVEL=DEBUG`.
++
++---
++
++## 6. Variables d'environnement (Phase 2)
++
++| Variable | Défaut | Rôle |
++|---|---|---|
++| `WEBRTC_ICE_SERVERS` | `stun:stun.l.google.com:19302` | serveurs ICE (liste d'URL séparées par virgules/espaces **ou** JSON `[{urls,username,credential}]`). **Vide ⇒ host-only** (un client derrière NAT échoue). |
++| `WEBRTC_TURN_URL` / `_USER` / `_PASS` | _(vide)_ | raccourci pour ajouter **un** relais TURN (quand STUN ne suffit pas). |
++| `WEBRTC_LOG_LEVEL` | `INFO` | niveau du logger applicatif (`DEBUG` pour tout voir). |
++| `WEBRTC_AIOICE_LOG` | `INFO` | niveau du logger ICE (`WARNING` pour réduire le bruit). |
++| `WEBRTC_MEDIA_HEARTBEAT_S` | `5` | période du heartbeat média. |
++| `WEBRTC_NO_FRAME_WARN_S` | `4` | délai avant l'alerte « 0 trame entrante ». |
++
++Les mêmes serveurs ICE servent **et** au serveur aiortc **et** au navigateur (via
++`/ice`) : une seule source de vérité.
++
++---
++
++## 7. Endpoints de diagnostic
++
++| Route | Rôle |
++|---|---|
++| `GET /diag` | tableau de bord JSON : compteurs cumulés (`global`), config ICE, et **métriques par session** (dont `frames_in`). |
++| `GET /ice` | liste des serveurs ICE servie au navigateur (`{"iceServers":[…]}`). |
++| `GET /health` | sonde + `sessions`, `ice_servers`, `frames_in_total`. |
++| `GET /poll?session=<id>` | état conversation + `frames_in`/`frames_out`/`ice_state` (déjà utilisé par la page). |
++
++---
++
++## 8. Reproduire / valider hors-ligne
++
++Le test d'intégration vérifie la chaîne **et** l'instrumentation (boucle locale
++⇒ host-only, donc sans dépendance à un STUN externe) :
++
++```bash
++.venv/bin/python tests/test_conversation.py
++# … ✅ CONVERSATION VALIDÉE …
++# … ✅ INSTRUMENTATION VALIDÉE : /ice + /diag + frames_in (Phase 2)
++```
++
++Sur le VPS, après `./restart.sh`, le **test de bout en bout** depuis le téléphone
++reste celui du RUNBOOK (§4–5) ; en cas de silence, ouvrir `/diag` **avant** tout :
++si `frames_in=0`, c'est §2 (NAT/STUN) — pas la peine de toucher au STT ni à Hermès.

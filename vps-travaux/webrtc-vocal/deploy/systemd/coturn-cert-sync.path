@@ -1,0 +1,17 @@
+# Surveille le certificat de Caddy : dès qu'il est (ré)écrit (renouvellement
+# Let's Encrypt), déclenche coturn-cert-sync.service pour le recopier vers coturn.
+#
+# NOTE : un .path systemd surveille UN chemin précis (pas de glob récursif). On
+# vise donc l'émetteur le plus courant (Let's Encrypt). Si Caddy bascule sur un
+# autre émetteur (ZeroSSL…), ce chemin ne « matchera » plus : c'est le timer
+# quotidien (coturn-cert-sync.timer) qui prend alors le relais — la synchro reste
+# garantie, juste avec au pire 24 h de latence. Adaptez le chemin si besoin.
+[Unit]
+Description=Surveille le renouvellement du certificat Caddy pour coturn
+
+[Path]
+PathModified=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/votre-domaine.example/votre-domaine.example.crt
+Unit=coturn-cert-sync.service
+
+[Install]
+WantedBy=multi-user.target

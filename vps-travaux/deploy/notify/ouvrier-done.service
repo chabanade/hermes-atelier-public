@@ -1,0 +1,18 @@
+# =============================================================================
+# ouvrier-done.service — déclenché par ouvrier-done.path (Solution A).
+# =============================================================================
+# Oneshot : il s'allume, pousse la notif (notify-hermes.sh), s'éteint. Rien ne
+# persiste entre deux fins de tâche. User=ouvrier pour lire le .done et joindre
+# la loopback (port 8080 du bot). Adapter User= si le bot tourne sous un autre
+# compte sur le VPS.
+[Unit]
+Description=Notifie Hermès qu'une tâche ouvrier est terminée (relais sans LLM)
+
+[Service]
+Type=oneshot
+User=ouvrier
+Group=ouvrier
+EnvironmentFile=-/home/ouvrier/travaux/deploy/notify/notify.env
+ExecStart=/home/ouvrier/travaux/deploy/notify/notify-hermes.sh
+# Ne jamais bloquer : si l'envoi échoue, le .done est archivé en *-FAILED.json.
+TimeoutStartSec=30

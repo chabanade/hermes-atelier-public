@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebRTC Vocal — Conversation (Brique 3/3)</title>
+<style>
+  :root{
+    --bg:#0e0f12; --panel:#16181d; --line:#24272e; --fg:#e6e6e6; --muted:#8a8f98;
+    --accent:#4f8cff; --ok:#37d67a; --err:#ff5c5c; --warn:#ffb84d; --speak:#b06cff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:var(--bg); color:var(--fg);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  .card{
+    width:min(480px,92vw); background:var(--panel); border:1px solid var(--line);
+    border-radius:14px; padding:28px; box-shadow:0 10px 40px rgba(0,0,0,.45);
+  }
+  h1{margin:0 0 4px; font-size:18px; font-weight:600}
+  p.sub{margin:0 0 22px; color:var(--muted); font-size:13px}
+  .status{display:flex; align-items:center; gap:10px; margin-bottom:18px; font-size:14px}
+  .dot{width:12px; height:12px; border-radius:50%; background:var(--muted); transition:.2s; flex:0 0 auto}
+  .dot.ok{background:var(--ok)}
+  .dot.err{background:var(--err)}
+  .dot.warn{background:var(--warn); animation:pulse 1s infinite}
+  .dot.listen{background:var(--ok); animation:pulse 1.6s infinite}
+  .dot.speak{background:var(--speak); animation:pulse .7s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  button{
+    width:100%; padding:14px; border:0; border-radius:10px; font-size:15px; font-weight:600;
+    color:#fff; background:var(--accent); cursor:pointer; transition:.15s;
+  }
+  button:hover{filter:brightness(1.08)}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  button.stop{background:#39414d}
+  .conv{margin-top:18px; display:flex; flex-direction:column; gap:10px; max-height:46vh; overflow:auto}
+  .bubble{border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:14px; line-height:1.5}
+  .bubble .who{display:block; font-size:11px; color:var(--muted); margin-bottom:3px}
+  .bubble.you{background:#0b0c0f}
+  .bubble.bot{background:#11151c; border-color:#2a3340}
+  .hint{margin-top:14px; color:var(--muted); font-size:12px; line-height:1.5}
+  .log{
+    margin-top:14px; height:96px; overflow:auto; background:#0b0c0f; border:1px solid var(--line);
+    border-radius:8px; padding:10px; font-family:ui-monospace,Menlo,monospace; font-size:11.5px;
+    color:var(--muted); white-space:pre-wrap; line-height:1.5;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎧 Hermès — conversation vocale</h1>
+    <p class="sub">Brique 3/3 — appel mains libres : parlez, Hermès répond en voix, vous répondez.</p>
+    <div class="status">
+      <span id="dot" class="dot"></span>
+      <span id="status">Déconnecté</span>
+    </div>
+    <button id="btn">Démarrer la conversation</button>
+    <div id="conv" class="conv"></div>
+    <p class="hint">Mettez vos oreillettes, cliquez « Démarrer », puis parlez naturellement.
+       Un silence d'environ une seconde signale à Hermès que vous avez fini votre phrase.</p>
+    <div id="log" class="log"></div>
+  </div>
+  <!-- Voix d'Hermès : lue automatiquement (le clic « Démarrer » autorise le son). -->
+  <audio id="bot-audio" autoplay playsinline></audio>
+
+  <script>
+    const btn = document.getElementById('btn');
+    const dot = document.getElementById('dot');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const convEl = document.getElementById('conv');
+    const botAudio = document.getElementById('bot-audio');
+    let pc = null;
+    let session = null;
+    let pollTimer = null;
+
+    function log(m){
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent += `[${t}] ${m}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(text, cls){
+      statusEl.textContent = text;
+      dot.className = 'dot' + (cls ? ' ' + cls : '');
+    }
+    // Rendu d'une bulle, créée ou mise à jour en place (clé = id).
+    function bubble(cls, who, text, id){
+      let el = document.getElementById(id);
+      if (!el){
+        el = document.createElement('div');
+        el.className = 'bubble ' + cls;
+        el.id = id;
+        el.innerHTML = '<span class="who"></span><span class="txt"></span>';
+        convEl.appendChild(el);
+      }
+      el.querySelector('.who').textContent = who;
+      el.querySelector('.txt').textContent = text;
+      convEl.scrollTop = convEl.scrollHeight;
+    }
+
+    // aiortc ne fait pas de trickle ICE : on attend la fin du gathering avant
+    // d'envoyer l'offre (les candidats sont inclus dans le SDP). Plafond de
+    // sécurité : si STUN tarde ou est bloqué, on n'attend pas indéfiniment — on
+    // part avec les candidats déjà récoltés (mieux vaut une offre partielle
+    // qu'une page figée).
+    function waitIceComplete(pc, timeoutMs = 4000){
+      if (pc.iceGatheringState === 'complete') return Promise.resolve();
+      return new Promise(res => {
+        let done = false;
+        const finish = () => {
+          if (done) return; done = true;
+          pc.removeEventListener('icegatheringstatechange', check); res();
+        };
+        const check = () => { if (pc.iceGatheringState === 'complete') finish(); };
+        pc.addEventListener('icegatheringstatechange', check);
+        setTimeout(() => { if (!done) {
+          log('⚠ gathering ICE > ' + timeoutMs + 'ms — envoi avec les candidats dispo');
+          finish();
+        } }, timeoutMs);
+      });
+    }
+
+    // Récupère la config STUN/TURN du serveur (source UNIQUE de vérité : elle est
+    // alignée sur celle du serveur aiortc, pilotée par WEBRTC_ICE_SERVERS).
+    async function fetchIceServers(){
+      try {
+        const r = await fetch('/ice');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const list = (await r.json()).iceServers || [];
+        log('config ICE : ' + (list.length
+          ? list.map(s => Array.isArray(s.urls) ? s.urls.join('/') : s.urls).join(', ')
+          : 'aucune (host-only)'));
+        return list;
+      } catch (e) {
+        log('⚠ /ice indisponible (' + e.message + ') — repli STUN Google');
+        return [{ urls: 'stun:stun.l.google.com:19302' }];
+      }
+    }
+
+    // Récapitule les candidats ICE récoltés (host/srflx/relay) depuis le SDP, et
+    // PRÉVIENT si aucun « srflx » : c'est le signe que STUN n'a rien renvoyé —
+    // derrière un NAT (4G, box), la connexion risque alors d'échouer.
+    function logCandidateTypes(sdp){
+      const types = {};
+      (sdp.match(/ typ (\w+)/g) || []).forEach(m => {
+        const t = m.trim().split(' ')[1]; types[t] = (types[t] || 0) + 1;
+      });
+      const summary = Object.entries(types).map(([k, v]) => k + '×' + v).join(', ');
+      log('candidats ICE locaux : ' + (summary || 'aucun'));
+      if (!types.srflx && !types.relay)
+        log('⚠ aucun candidat « srflx » : STUN muet/bloqué. Derrière un NAT, ' +
+            'la connexion peut échouer (vois DIAGNOSTIC.md).');
+    }
+
+    async function start(){
+      btn.disabled = true;
+      convEl.innerHTML = '';
+      session = (crypto.randomUUID && crypto.randomUUID()) ||
+                ('s-' + Date.now() + '-' + Math.random().toString(16).slice(2));
+      try {
+        setStatus('Demande du micro…', 'warn');
+        // echo/bruit/gain : indispensables pour qu'Hermès ne s'entende pas lui-même.
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true },
+          video:false
+        });
+        log('micro OK — session ' + session.slice(0,8));
+
+        const iceServers = await fetchIceServers();   // STUN/TURN fournis par le serveur
+        pc = new RTCPeerConnection({ iceServers });
+        pc._localStream = stream;
+
+        // Voix d'Hermès entrante -> élément <audio> (lecture auto).
+        pc.addEventListener('track', (ev) => {
+          log('piste reçue : ' + ev.track.kind);
+          if (ev.track.kind === 'audio') botAudio.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+        });
+
+        // Traçage ICE : indispensable pour diagnostiquer un échec de connexion.
+        pc.addEventListener('iceconnectionstatechange', () => log('ICE: ' + pc.iceConnectionState));
+        pc.addEventListener('icegatheringstatechange', () => log('ICE gathering: ' + pc.iceGatheringState));
+
+        pc.addEventListener('connectionstatechange', () => {
+          log('connection: ' + pc.connectionState);
+          if (pc.connectionState === 'connected') setStatus('🎧 À votre écoute', 'listen');
+          else if (pc.connectionState === 'connecting') setStatus('Connexion…', 'warn');
+          else if (['failed','disconnected','closed'].includes(pc.connectionState)) {
+            stop(pc.connectionState === 'failed' ? 'Connexion échouée' : null);
+          }
+        });
+
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+        setStatus('Négociation…', 'warn');
+        await pc.setLocalDescription(await pc.createOffer());
+        await waitIceComplete(pc);
+        logCandidateTypes(pc.localDescription.sdp);
+        log('offre SDP prête, envoi à /offer');
+
+        const resp = await fetch('/offer', {
+          method:'POST', headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, session })
+        });
+        if (!resp.ok) throw new Error('serveur HTTP ' + resp.status);
+        const answer = await resp.json();
+        if (answer.session) session = answer.session;
+        await pc.setRemoteDescription(answer);
+        log('answer reçue — conversation ouverte');
+
+        btn.textContent = 'Raccrocher';
+        btn.classList.add('stop');
+        btn.disabled = false;
+        btn.onclick = () => stop();
+        startPolling();
+      } catch (err) {
+        log('ERREUR: ' + err.message);
+        setStatus('Erreur — ' + err.message, 'err');
+        stop();
+      }
+    }
+
+    // Indicateur d'état + sous-titres, rafraîchis toutes les 800 ms (cf. cahier des charges).
+    function startPolling(){
+      const mine = session;
+      const STATUS = {
+        listening:   ['🎧 À votre écoute',     'listen'],
+        speech:      ['🗣️ Vous parlez…',       'ok'],
+        transcribing:['✍️ Transcription…',     'warn'],
+        thinking:    ['🧠 Hermès réfléchit…',  'warn'],
+        speaking:    ['🔊 Hermès parle…',      'speak'],
+        connecting:  ['Connexion…',            'warn'],
+        ended:       ['Terminé',               ''],
+      };
+      const step = async () => {
+        if (mine !== session) return;            // une autre conversation a démarré / arrêt
+        let d;
+        try {
+          const r = await fetch('/poll?session=' + encodeURIComponent(mine));
+          d = await r.json();
+        } catch (e) { pollTimer = setTimeout(step, 800); return; }
+
+        (d.turns || []).forEach(t => {
+          if (t.transcript) bubble('you', '🗣️ Vous',  t.transcript, 'you-' + t.turn);
+          if (t.reply)      bubble('bot', '🤖 Hermès', t.reply,      'bot-' + t.turn);
+        });
+
+        let [txt, cls] = STATUS[d.status] || ['…', ''];
+        if (d.speaking) [txt, cls] = STATUS.speaking;   // la voix prime sur l'état
+        if (d.status === 'error') [txt, cls] = ['Erreur — ' + (d.error || 'inconnue'), 'err'];
+        setStatus(txt, cls);
+
+        pollTimer = setTimeout(step, 800);
+      };
+      step();
+    }
+
+    function stop(msg){
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      session = null;                            // stoppe le polling en cours
+      if (pc) {
+        try { pc.getSenders().forEach(s => s.track && s.track.stop()); } catch(e){}
+        if (pc._localStream) pc._localStream.getTracks().forEach(t => t.stop());
+        try { pc.close(); } catch(e){}
+        pc = null;
+      }
+      botAudio.srcObject = null;
+      setStatus(msg || 'Déconnecté', msg ? 'err' : '');
+      btn.textContent = 'Démarrer la conversation';
+      btn.classList.remove('stop');
+      btn.disabled = false;
+      btn.onclick = start;
+    }
+
+    btn.onclick = start;
+
+    // getUserMedia exige un contexte sécurisé (https) — sauf sur localhost.
+    if (!window.isSecureContext) {
+      log('⚠ contexte non sécurisé : le micro sera bloqué hors localhost. Utilise un tunnel SSH ou du https.');
+    }
+  </script>
+</body>
+</html>

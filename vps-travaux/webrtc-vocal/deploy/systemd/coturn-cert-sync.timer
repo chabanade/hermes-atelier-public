@@ -1,0 +1,16 @@
+# Filet de sécurité : resynchronise le certificat une fois par jour, quel que
+# soit l'émetteur ACME (couvre les cas où coturn-cert-sync.path ne se déclenche
+# pas — autre émetteur, événement manqué après un reboot…). Le script ne
+# redémarre coturn QUE si le certificat a réellement changé : ce tick est gratuit
+# en régime établi.
+[Unit]
+Description=Resynchronisation quotidienne du certificat coturn (filet)
+
+[Timer]
+OnCalendar=daily
+# Rattrape le tick manqué si la machine était éteinte/endormie.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

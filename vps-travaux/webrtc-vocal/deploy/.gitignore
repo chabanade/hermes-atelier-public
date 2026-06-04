@@ -1,0 +1,8 @@
+# Ne jamais committer de clé privée / certificat généré localement.
+certs/
+*.pem
+*.key
+
+# Secret du relais TURN (généré par install-coturn.sh).
+turn.env
+turn.env.off

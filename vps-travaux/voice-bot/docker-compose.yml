@@ -1,0 +1,58 @@
+# docker-compose du bot vocal Hermès.
+#
+# Deux services :
+#   - voice-bot : le bot Telegram (toujours lancé).
+#   - speaches  : le STT/TTS local (faster-whisper + Kokoro). Optionnel ici :
+#                 il n'est démarré QUE si tu actives le profil "with-stt".
+#                 Si Speaches tourne déjà ailleurs sur le VPS, ne l'active pas et
+#                 pointe STT_BASE_URL vers l'instance existante dans le .env.
+#
+# Démarrage :
+#   cp .env.example .env   &&   nano .env          # renseigne le token, l'ID, les chemins
+#   docker compose up -d                            # bot seul (Speaches déjà en place)
+#   docker compose --profile with-stt up -d         # bot + Speaches co-hébergé
+
+name: hermes-voice
+
+services:
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: speaches
+    restart: always
+    profiles: ["with-stt"]
+    volumes:
+      # Cache des modèles Hugging Face (évite de re-télécharger à chaque redémarrage).
+      - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+    # Décommente pour exposer Speaches sur l'hôte (sinon : réseau interne uniquement).
+    # ports:
+    #   - "8000:8000"
+    healthcheck:
+      # python est garanti présent dans l'image (Speaches est une appli Python).
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  voice-bot:
+    build: .
+    image: hermes-voice-bot:latest
+    container_name: hermes-voice-bot
+    restart: always
+    env_file: .env
+    environment:
+      # Valeurs par défaut surchargeables depuis le .env.
+      STT_BASE_URL: ${STT_BASE_URL:-http://speaches:8000}
+      QUEUE_IN: ${QUEUE_IN:-/opt/data/claude-queue/in}
+      QUEUE_OUT: ${QUEUE_OUT:-/opt/data/claude-queue/out}
+    volumes:
+      # File partagée avec l'aiguilleur Hermès (même chemin dans et hors du conteneur).
+      - /opt/data/claude-queue:/opt/data/claude-queue
+    ports:
+      - "8080:8080"   # /health pour Uptime Kuma et le healthcheck Docker
+    # Le bot tolère que Speaches démarre après lui (il réessaie à chaque message),
+    # donc pas de depends_on bloquant : il reste up même si le STT est momentanément KO.
+
+volumes:
+  hf-hub-cache:

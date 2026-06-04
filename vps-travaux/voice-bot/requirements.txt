@@ -1,0 +1,4 @@
+# Dépendances du bot vocal Hermès (Python 3.11+).
+aiogram>=3.13,<4      # bot Telegram (API moderne, async)
+httpx>=0.27,<1        # appels HTTP async vers le STT/TTS (Speaches)
+aiohttp>=3.9,<4       # serveur de healthcheck (et transport d'aiogram)

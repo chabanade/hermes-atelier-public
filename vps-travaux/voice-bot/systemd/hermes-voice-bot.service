@@ -1,0 +1,29 @@
+[Unit]
+Description=Bot Telegram vocal Hermes (STT/TTS local -> aiguilleur)
+Documentation=https://github.com/ (voir DEPLOIEMENT.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes-voice-bot
+# Fichier d'environnement (mêmes clés que env.example).
+EnvironmentFile=/etc/hermes-voice-bot.env
+ExecStart=/opt/hermes-voice-bot/.venv/bin/python -m voice_bot
+
+# Auto-réparation : redémarrage systématique en cas d'arrêt anormal.
+Restart=always
+RestartSec=5
+
+# Durcissement léger.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+# La file de l'aiguilleur doit rester accessible en écriture malgré ProtectSystem.
+ReadWritePaths=/opt/data/claude-queue
+
+[Install]
+WantedBy=multi-user.target

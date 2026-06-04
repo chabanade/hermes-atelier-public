@@ -1,0 +1,18 @@
+# =============================================================================
+# ouvrier-done.path — Solution A (RECOMMANDÉE) : watch inotify natif systemd.
+# =============================================================================
+# Au repos : le NOYAU attend (inotify). Aucun process, aucun CPU, ZÉRO token.
+# Dès que /home/ouvrier/travaux/.done existe, systemd lance ouvrier-done.service.
+# Le relais SUPPRIME ensuite le .done -> le watch se réarme pour la prochaine
+# tâche. PathExists (et non PathModified) garantit le rattrapage même si le
+# watcher était arrêté au moment de l'écriture : au démarrage, s'il y a déjà un
+# .done en attente, le service part quand même. => aucune notification ratée.
+[Unit]
+Description=Watch du signal de fin de tâche ouvrier (.done) -> notifie Hermès
+
+[Path]
+PathExists=/home/ouvrier/travaux/.done
+Unit=ouvrier-done.service
+
+[Install]
+WantedBy=multi-user.target

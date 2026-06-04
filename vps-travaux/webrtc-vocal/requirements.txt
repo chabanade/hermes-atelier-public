@@ -1,0 +1,35 @@
+# Brique 3/3 — conversation vocale continue.
+#
+# Ce venv est SELF-CONTAINED : il porte la couche temps réel (WebRTC/HTTP,
+# conversion audio, VAD) ET la couche STT/TTS (faster-whisper + Piper), appelée
+# en sous-processus par transcribe.py / synth.py (cf. WHISPER_PYTHON / TTS_PYTHON
+# dans server.py). Plus aucun venv externe.
+# av (PyAV), tiré par aiortc, sert au rééchantillonnage 48k <-> 16k.
+aiohttp
+aiortc
+numpy
+
+# --- STT + TTS (sous-processus, même venv) -----------------------------------
+# faster-whisper : transcription (modèle whisper en cache sous models/hf/).
+# piper-tts      : synthèse vocale (voix .onnx sous models/piper/).
+# server.py les lance via transcribe.py / synth.py ; le préflight de server.py
+# vérifie au démarrage qu'ils sont bien importables, sinon il refuse de démarrer.
+faster-whisper
+piper-tts
+
+# --- VAD (détection d'activité vocale), tourne en local, sans GPU ------------
+# Backend choisi automatiquement par server.py : silero -> webrtcvad -> énergie.
+#
+# webrtcvad : léger et robuste. Le paquet « webrtcvad » se compile (en-têtes
+# python3-dev requis) ; « webrtcvad-wheels » fournit des roues précompilées
+# (aucune compilation) — recommandé.
+webrtcvad-wheels
+
+# Optionnel — VAD neuronal (meilleure qualité, plus lourd : tire torch). S'il est
+# présent, server.py le préfère automatiquement (WEBRTC_VAD=auto). Sinon, repli
+# transparent sur webrtcvad, puis sur le VAD par énergie (numpy seul, sans dép.).
+# silero-vad
+# torch
+
+# Le VAD par énergie ne dépend que de numpy : il sert toujours de filet de
+# sécurité et rend les tests hors-ligne déterministes (WEBRTC_VAD=energy).

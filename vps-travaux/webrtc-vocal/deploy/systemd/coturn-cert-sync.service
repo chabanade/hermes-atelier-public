@@ -1,0 +1,13 @@
+# Resynchronise le certificat TLS de coturn avec celui de Caddy (Let's Encrypt).
+# Oneshot : déclenché par coturn-cert-sync.path (au renouvellement) ET par
+# coturn-cert-sync.timer (filet quotidien). Installé par deploy/install-coturn.sh.
+[Unit]
+Description=Synchronise le certificat Let's Encrypt (Caddy) vers coturn
+# On veut tourner après que Caddy a (ré)écrit le certificat.
+After=caddy.service
+Wants=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/coturn-cert-sync.sh
+# Le script gère lui-même « rien n'a changé » → pas de bruit, pas de restart inutile.

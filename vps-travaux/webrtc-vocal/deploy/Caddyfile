@@ -1,0 +1,31 @@
+# /etc/caddy/Caddyfile — HTTPS pour le serveur WebRTC vocal (brique 3/3)
+#
+# Pourquoi Caddy : il obtient ET renouvelle TOUT SEUL un certificat Let's Encrypt
+# VALIDE (donc reconnu par les navigateurs -> getUserMedia() fonctionne sans
+# avertissement), écoute en 443 (et redirige 80 -> 443), et reverse-proxy vers le
+# serveur Python qui, lui, reste en HTTP local sur 127.0.0.1:8686 (inchangé).
+#
+# Le domaine ci-dessous est le FQDN PAR DÉFAUT du VPS Hostinger : il résout déjà
+# publiquement vers ce VPS (VOTRE_IP_VPS), aucun achat de domaine nécessaire.
+#
+# Domaine perso ? Remplacez « votre-domaine.example » par p.ex. « voix.exemple.fr »
+# APRÈS avoir créé chez votre registrar un enregistrement :
+#     A   voix.exemple.fr   ->   VOTRE_IP_VPS
+# puis « systemctl reload caddy ». Caddy fera le reste (certificat compris).
+#
+# Prérequis réseau : les ports 80 ET 443 doivent être ouverts (pare-feu Hostinger
+# dans hPanel + ufw le cas échéant) — Let's Encrypt valide le domaine via le 80.
+
+votre-domaine.example {
+	encode zstd gzip
+
+	# Signalisation WebRTC (POST /offer, GET /poll, GET /health, page /) + statique.
+	# Le média WebRTC (audio SRTP/UDP) va en pair-à-pair via ICE, PAS par Caddy.
+	reverse_proxy 127.0.0.1:8686 {
+		# Laisse de la marge : un tour de parole peut attendre la réponse d'Hermès.
+		transport http {
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+}

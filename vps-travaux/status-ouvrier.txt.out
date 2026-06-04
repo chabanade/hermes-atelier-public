@@ -1,0 +1,61 @@
+RAPPORT D'ÉTAT — « ouvrier » (worker Claude)
+Généré : 2026-06-04 ~05:44 UTC
+Demandé : vérif uptime / stabilité / traitement de la file claude-queue
+
+⚠️ NOTE DE LIVRAISON (à lire en premier)
+Tu m'as demandé de répondre dans /opt/data/claude-queue/out/status-ouvrier.txt.out.
+Je NE PEUX PAS t'y atteindre. Dans ma cage bwrap, /opt n'est pas monté : il est
+recréé à la volée sur le tmpfs éphémère du sandbox (device 51), détruit à la fin
+du process. Écrire là « réussit » (exit 0) mais le fichier s'évapore — un script
+qui se fie au code retour croira à tort que c'est livré. Preuve :
+    stat device  /  et /opt/data        -> 51  (tmpfs, 3.9G, éphémère)
+    stat device  ~/travaux et ~/journal -> 2049 (/dev/sda1, disque hôte réel)
+Seuls ~/travaux, ~/journal, ~/.claude persistent côté hôte. Ce rapport est donc
+livré (a) sur ma sortie stdout, et (b) ici : ~/travaux/status-ouvrier.txt.out.
+
+────────────────────────────────────────────────────────────────────────
+1) UPTIME — « depuis combien de temps tournes-tu ? »
+Je ne suis pas un démon persistant. Chaque requête lance un processus
+`claude -p` neuf dans une cage bwrap jetable, puis le détruit. Le « moi » qui te
+répond a démarré à 2026-06-04 05:41:51 UTC, il y a quelques secondes.
+ - uptime du WORKER  ≈ la durée de cette seule requête (secondes).
+ - uptime de l'HÔTE  = 3 j 7 h 30 (boot 2026-05-31 22:11:44 UTC ; charge 0.05 —
+   machine saine et au repos).
+Si une supervision affiche « ouvrier up 3 j », elle mesure l'hôte/l'orchestrateur,
+pas moi.
+
+2) STABILITÉ — timeouts / crashes récents ?
+Je suis sans état entre invocations : je ne peux pas attester de ma propre
+histoire de crash. Je ne peux que LIRE le journal. Ce qu'il montre :
+ - copilote.log + videur.log : activité continue du 2 au 4 juin, AUCUN marqueur
+   de crash ni de timeout.
+ - Trou 2026-06-03 23:55 → 2026-06-04 05:41 (~5 h 46) = inactivité nocturne
+   (aucune requête), pas une panne.
+ - Garde-fous ACTIFS et fonctionnels : refus videur (curl, wget, .env,
+   .claude/settings|hooks) ; ALERTE-RISQUE « laissées passer, surveillées »
+   (accès secret, effacement de masse). Ma propre sonde `ls ~/hooks` a déclenché
+   un ALERTE-MORTEL anti-tamper — c'est le système qui fonctionne, pas un bug.
+Verdict : aucun signe d'instabilité dans les traces ; mais « stable depuis X »
+n'est pas une chose que JE peux certifier — c'est à mesurer côté orchestrateur.
+
+3) TRAITEMENT DE /opt/data/claude-queue/in/ — confirmé ?
+NON, et je ne peux pas le confirmer depuis la cage : /opt n'y existe pas (voir
+preuve tmpfs ci-dessus). Aucun dossier in/ ni out/ n'est visible dans mon
+namespace. Conclusion d'architecture :
+ - Le POLLER de la file tourne forcément HORS sandbox (un orchestrateur hôte qui
+   lit in/, me lance avec le contenu en `-p`, récupère mon stdout, écrit out/).
+ - Moi = exécuteur par-message. Je ne « surveille » aucune file ; je traite le
+   message qu'on me tend, puis je disparais.
+ - Rappel mémoire : /opt/data = PROD (VPS). Ici je suis dans la copie DEV
+   ~/travaux. Si tu attends ce rapport sur le VPS prod, c'est l'orchestrateur
+   côté hôte qu'il faut vérifier, pas l'ouvrier.
+
+────────────────────────────────────────────────────────────────────────
+À VÉRIFIER CÔTÉ HÔTE (là où vit la vraie file — hors de ma portée) :
+ [ ] l'orchestrateur (systemd/cron ?) tourne-t-il et lit-il bien in/ ?
+ [ ] écrit-il out/<fichier>.out à partir de mon stdout ?
+ [ ] la cage doit-elle monter /opt ? Actuellement NON (sain, surface réduite).
+     Si le worker devait toucher la file lui-même, il faudrait un
+     `--bind /opt/data/claude-queue /opt/data/claude-queue` explicite — mais
+     ça élargit la surface d'attaque ; à ne faire que si c'est vraiment voulu.
+— fin du rapport —
