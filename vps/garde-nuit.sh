@@ -172,7 +172,19 @@ if [ -f "$CERTIF_FILE" ]; then
   fi
 fi
 
-# 6) briefing si c'est l'heure (08h / 20h Paris), 1x/jour
+# 6) rappel workshop ELITE (1x/jour ; s'auto-desactive apres la date de gel)
+WORKSHOP_DEADLINE=${GN_WORKSHOP_DEADLINE:-20260610}
+wa=$(oget workshop_alert); NEW_workshop_alert="$wa"
+if [ "$(TZ=Europe/Paris date +%Y%m%d)" -le "$WORKSHOP_DEADLINE" ]; then
+  if [ "$wa" != "$PARIS_DATE" ]; then
+    addalerte "📌 Workshop Hermès : pense à poster ton *daily* sur le hub + un commit aujourd'hui (gel le 10/06 ; la règle libère ta place après 2 jours sans rien)."
+    NEW_workshop_alert="$PARIS_DATE"
+  fi
+else
+  NEW_workshop_alert=""
+fi
+
+# 7) briefing si c'est l'heure (08h / 20h Paris), 1x/jour
 bm=$(oget brief_morning); be=$(oget brief_evening)
 NEW_bm="$bm"; NEW_be="$be"; BRIEF=""
 if [ "$PARIS_H" = "08" ] && [ "$bm" != "$PARIS_DATE" ]; then BRIEF=matin; NEW_bm="$PARIS_DATE"; fi
@@ -184,6 +196,7 @@ if [ "$PARIS_H" = "20" ] && [ "$be" != "$PARIS_DATE" ]; then BRIEF=soir;  NEW_be
   echo "disk_alert=$NEW_disk_alert"
   echo "cert_alert=$NEW_cert_alert"
   echo "certif_metier_alert=$NEW_certif_metier_alert"
+  echo "workshop_alert=$NEW_workshop_alert"
   echo "ouvrier_stuck=$nstuck"
   echo "brief_morning=$NEW_bm"
   echo "brief_evening=$NEW_be"
