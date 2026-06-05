@@ -63,7 +63,7 @@ foreach ($f in $orders) {
         Push-Status $f $beat                         # le battement monte -> Hermes voit que ca avance
     }
     if ($fige) {
-        $raw = "[releveur PC] Ordre interrompu : l'ouvrier WSL a depasse le delai de 60 min (process arrete)."
+        $raw = "[releveur PC] Ordre interrompu : l'ouvrier WSL a depasse le delai (75 min, process arrete)."
     } else {
         $raw = (Get-Content $outF -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
     }
@@ -88,9 +88,15 @@ foreach ($f in $orders) {
 
     # --- Deposer la reponse dans la boite d'Hermes (base64 = transport sur) ---
     $b64out = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($result))
-    ssh @Opt $Vps "echo $b64out | base64 -d > $OutBox/$f.out; chown 10000:10000 $OutBox/$f.out 2>/dev/null; chmod 644 $OutBox/$f.out"
-    ssh @Opt $Vps "rm -f $OutBox/$f.status"          # colis livre : on retire le suivi de colis
-    ssh @Opt $Vps "mv $Base/in/$f $Base/done/$f"
-    Write-Host "[releveur] Resultat depose : out/$f.out"
+    # Livraison en UN SEUL appel SSH (atomicite logique) : le mv vers done/ n'a
+    # lieu QUE si l'ecriture du .out a reussi. En cas de coupure SSH, l'ordre
+    # reste dans in/ et sera retente au prochain passage -- jamais perdu.
+    $deliver = "echo $b64out | base64 -d > $OutBox/$f.out && { chown 10000:10000 $OutBox/$f.out 2>/dev/null; chmod 644 $OutBox/$f.out; rm -f $OutBox/$f.status; mv $Base/in/$f $Base/done/$f; }"
+    ssh @Opt $Vps $deliver
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[releveur] ATTENTION : livraison SSH echouee (code $LASTEXITCODE) pour $f -- l'ordre sera retente au prochain passage (verifie la cle SSH / le reseau)."
+    } else {
+        Write-Host "[releveur] Resultat depose : out/$f.out"
+    }
 }
 Write-Host "[releveur] Termine."

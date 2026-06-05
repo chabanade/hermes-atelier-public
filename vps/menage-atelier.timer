@@ -1,0 +1,10 @@
+[Unit]
+Description=Menage quotidien de l'atelier Hermes
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

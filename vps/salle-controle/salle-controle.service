@@ -1,0 +1,16 @@
+[Unit]
+Description=Salle de controle de l'atelier Hermes (vue des ouvriers + ordres, via Caddy/HTTPS)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/.hermes/salle-controle/serveur.py
+Restart=always
+RestartSec=3
+User=root
+# Ecoute uniquement en local : c'est Caddy (HTTPS + mot de passe) qui l'expose.
+Environment=SC_HOST=127.0.0.1
+Environment=SC_PORT=8787
+
+[Install]
+WantedBy=multi-user.target

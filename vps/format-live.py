@@ -15,6 +15,7 @@ result_path = sys.argv[2] if len(sys.argv) > 2 else "/dev/null"
 hermes_uid  = int(sys.argv[3]) if len(sys.argv) > 3 else 10000
 
 result_text = ""
+last_text = ""   # dernier message texte de l'ouvrier (filet anti-"reponse vide")
 lf = open(live_path, "w", encoding="utf-8")
 lf.write(">>> L'OUVRIER TRAVAILLE -- avancement EN DIRECT (ce fichier grandit a chaque action) <<<\n\n")
 lf.flush()
@@ -51,6 +52,7 @@ for raw in sys.stdin:
             if bt == "text":
                 txt = (b.get("text") or "").strip()
                 if txt:
+                    last_text = txt
                     emit("\U0001F4AC " + short(txt, 500))          # 💬 ce que dit l'ouvrier
             elif bt == "tool_use":
                 name = b.get("name", "?")
@@ -71,6 +73,12 @@ for raw in sys.stdin:
         r = e.get("result")
         if isinstance(r, str):
             result_text = r
+
+# Filet : si l'ouvrier n'a pas emis d'evenement "result" final (max-turns,
+# coupure, crash en aval...), on retombe sur son DERNIER message plutot que de
+# livrer du vide -> Hermes voit au moins ce que l'ouvrier disait en dernier.
+if not result_text and last_text:
+    result_text = last_text + "\n\n[note systeme : reponse finale non emise -- ci-dessus le dernier message de l'ouvrier.]"
 
 try:
     with open(result_path, "w", encoding="utf-8") as rf:

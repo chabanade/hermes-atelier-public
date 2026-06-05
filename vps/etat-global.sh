@@ -38,6 +38,7 @@ livef=$(ls "$Q/out/"*.live 2>/dev/null | head -1)
   echo "| Caddy (HTTPS)                | $cad |"
   echo ""
   echo "## Bot vocal (https://$DOMAINE)"
+  [ -z "$diag" ] && echo "- ⚠️ serveur vocal **injoignable** sur l'hote (pas de reponse a /diag) -- il est peut-etre arrete."
   echo "- TURN annonce au navigateur (/ice) : **$turn**"
   echo "- Sessions connectees (total) : ${sessions:-?}"
   echo "- Audio recu (frames_in)      : ${frames:-?}   _(>0 = l'audio passe ; 0 = il faut le TURN)_"

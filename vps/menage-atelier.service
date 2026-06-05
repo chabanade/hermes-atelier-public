@@ -1,0 +1,6 @@
+[Unit]
+Description=Menage de la boite aux lettres de l'atelier Hermes (retention out/done/live)
+
+[Service]
+Type=oneshot
+ExecStart=/root/menage-atelier.sh

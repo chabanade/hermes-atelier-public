@@ -145,6 +145,11 @@ if [ -f "$QUEUE/STOP" ]; then log "STOP present -- aiguilleur en pause"; exit 0;
 exec 9>"$QUEUE/.aiguilleur.lock"
 flock -n 9 || { log "deja en cours -- on saute cette passe"; exit 0; }
 
+# Filet de securite : nettoie les fichiers temporaires de l'ordre en cours quoi
+# qu'il arrive (interruption, kill du script) -- evite l'accumulation de /tmp/tmp.*.
+MARQUEUR=""; TMPRESULT=""
+trap 'rm -f "$MARQUEUR" "$TMPRESULT" 2>/dev/null' EXIT
+
 # --- TABLEAU DE BORD : vue d'ensemble permanente pour Hermes (rafraichi a chaque passe) ---
 [ -x "$ETATGW" ] && "$ETATGW" "$ETAT_OUT" "$HERMES_UID" 2>/dev/null
 
@@ -153,7 +158,14 @@ for f in "$QUEUE/in/"*; do
   [ -f "$f" ] || continue
   name=$(basename "$f")
   ORDRE=$(cat "$f")
-  [ -n "$ORDRE" ] || { mv "$f" "$QUEUE/done/$name"; continue; }
+  if [ -z "$ORDRE" ]; then
+    printf '%s' "[AIGUILLEUR] Ordre vide ou illisible -- rien a traiter (souci de transmission, pas un blocage de l'ouvrier)." > "$QUEUE/out/$name.out"
+    chown "$HERMES_UID:$HERMES_UID" "$QUEUE/out/$name.out" 2>/dev/null
+    chmod 644 "$QUEUE/out/$name.out"
+    mv "$f" "$QUEUE/done/$name"
+    log "VIDE $name (ordre vide) -> out"
+    continue
+  fi
 
   # --- ROUTAGE : si l'ordre cible le PC (@pc en tete) -> on le transfere a la file PC
   #     (relevee par le poller du PC VOTRE_USER). L'aiguilleur VPS ne le traite PAS lui-meme.

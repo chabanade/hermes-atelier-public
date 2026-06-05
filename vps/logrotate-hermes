@@ -1,0 +1,31 @@
+# Rotation des journaux de l'atelier Hermes -> a deployer dans /etc/logrotate.d/hermes
+# Evite qu'un journal grossisse sans fin et sature le disque en silence.
+# copytruncate : indispensable ici car l'aiguilleur garde le fichier ouvert et
+# y ajoute en continu (on tronque la copie au lieu de bouger l'inode).
+# Deux blocs : les journaux root, et ceux de l'ouvrier (dossier non-root -> "su").
+
+/root/.hermes/*.log
+/root/.hermes/claude-queue/*.log
+{
+    weekly
+    rotate 4
+    size 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+
+/home/ouvrier/journal/*.log
+{
+    su ouvrier ouvrier
+    weekly
+    rotate 4
+    size 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
