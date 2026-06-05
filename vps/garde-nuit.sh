@@ -147,7 +147,32 @@ fi
 ostuck=$(oget ouvrier_stuck); [ -n "$ostuck" ] || ostuck=0
 [ "$nstuck" = 1 ] && [ "$ostuck" != 1 ] && addalerte "⚠️ L'ouvrier tourne depuis plus de ${OUVRIER_MAX_MIN} min sur la même tâche — possible blocage."
 
-# 5) briefing si c'est l'heure (08h / 20h Paris), 1x/jour
+# 5) certifs metier (echeances listees dans un fichier ; 1x/jour max si une approche/expire)
+CERTIF_FILE=${GN_CERTIF_FILE:-/root/.hermes/certifs-metier.txt}
+CERTIF_ALERT_J=${GN_CERTIF_ALERT_J:-60}     # commence a alerter N jours avant l'echeance
+cma=$(oget certif_metier_alert); NEW_certif_metier_alert="$cma"
+if [ -f "$CERTIF_FILE" ]; then
+  proches=""
+  while IFS='|' read -r dte lib; do
+    dte=$(printf '%s' "$dte" | tr -d ' ')
+    case "$dte" in ''|'#'*) continue;; esac          # ignore lignes vides et commentaires
+    secs=$(date -d "$dte" +%s 2>/dev/null) || continue
+    jours=$(( (secs - $(date +%s)) / 86400 ))
+    if [ "$jours" -lt 0 ]; then
+      proches="${proches}- ⛔ « ${lib} » est EXPIRÉE depuis $(( -jours )) j (${dte})"$'\n'
+    elif [ "$jours" -le "$CERTIF_ALERT_J" ]; then
+      proches="${proches}- ⏳ « ${lib} » expire dans ${jours} j (${dte})"$'\n'
+    fi
+  done < "$CERTIF_FILE"
+  if [ -n "$proches" ]; then
+    [ "$cma" != "$PARIS_DATE" ] && addalerte "📋 Certifs métier à surveiller :"$'\n'"${proches}"
+    NEW_certif_metier_alert="$PARIS_DATE"
+  else
+    NEW_certif_metier_alert=""
+  fi
+fi
+
+# 6) briefing si c'est l'heure (08h / 20h Paris), 1x/jour
 bm=$(oget brief_morning); be=$(oget brief_evening)
 NEW_bm="$bm"; NEW_be="$be"; BRIEF=""
 if [ "$PARIS_H" = "08" ] && [ "$bm" != "$PARIS_DATE" ]; then BRIEF=matin; NEW_bm="$PARIS_DATE"; fi
@@ -158,6 +183,7 @@ if [ "$PARIS_H" = "20" ] && [ "$be" != "$PARIS_DATE" ]; then BRIEF=soir;  NEW_be
   for s in $SERVICES; do echo "svc_$s=${SVCNEW[$s]}"; done
   echo "disk_alert=$NEW_disk_alert"
   echo "cert_alert=$NEW_cert_alert"
+  echo "certif_metier_alert=$NEW_certif_metier_alert"
   echo "ouvrier_stuck=$nstuck"
   echo "brief_morning=$NEW_bm"
   echo "brief_evening=$NEW_be"
