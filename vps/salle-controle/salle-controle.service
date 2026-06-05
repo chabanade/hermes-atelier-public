@@ -11,6 +11,8 @@ User=root
 # Ecoute uniquement en local : c'est Caddy (HTTPS + mot de passe) qui l'expose.
 Environment=SC_HOST=127.0.0.1
 Environment=SC_PORT=8787
+# Jeton du pont vocal Siri (hors git) : fichier root-only cree sur le VPS.
+EnvironmentFile=-/root/.hermes/salle-controle/siri.env
 
 [Install]
 WantedBy=multi-user.target

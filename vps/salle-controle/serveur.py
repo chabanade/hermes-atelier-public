@@ -211,6 +211,49 @@ def basculer_pause(activer):
         return {"ok": False, "message": f"Echec : {e}"}
 
 
+# --- PONT VOCAL SIRI : texte -> Hermes -> texte (pour un Raccourci iPhone) ------
+#  Mains-libres : un Raccourci Siri dicte la question (voix->texte cote iOS), la
+#  POST ici ; on passe par la MEME boite partagee que la voix Telegram/web (le
+#  demon webrtc-reply appelle Hermes), et on renvoie le texte de la reponse ;
+#  l'iPhone le lit a voix haute. Pas de STT/TTS ici : iOS s'en charge.
+VOICE_DATA = os.environ.get("SC_VOICE_DATA", "/home/ouvrier/travaux/webrtc-vocal/data")
+VOICE_INBOX = os.path.join(VOICE_DATA, "inbox")
+VOICE_OUTBOX = os.path.join(VOICE_DATA, "outbox")
+SIRI_TOKEN = os.environ.get("SC_SIRI_TOKEN", "")
+SIRI_TIMEOUT = float(os.environ.get("SC_SIRI_TIMEOUT", "90"))
+
+
+def hermes_siri(texte):
+    texte = (texte or "").strip()
+    if not texte:
+        return {"ok": False, "reply": "Je n'ai rien entendu."}
+    sid = "siri-" + time.strftime("%Y%m%d-%H%M%S") + "-" + str(int(time.time() * 1000) % 1000)
+    rec = {"session_id": sid, "text": texte, "status": "pending", "source": "siri"}
+    try:
+        os.makedirs(VOICE_INBOX, exist_ok=True)
+        _ecrire_atomique(os.path.join(VOICE_INBOX, sid + ".json"),
+                         json.dumps(rec, ensure_ascii=False))
+    except Exception as e:
+        return {"ok": False, "reply": f"Souci d'envoi a Hermes ({e})."}
+    out = os.path.join(VOICE_OUTBOX, sid + ".json")
+    deadline = time.time() + SIRI_TIMEOUT
+    while time.time() < deadline:
+        if os.path.exists(out):
+            try:
+                with open(out, encoding="utf-8") as f:
+                    reply = (json.load(f).get("reply") or "").strip()
+            except Exception:
+                time.sleep(0.4)
+                continue
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+            return {"ok": True, "reply": reply or "Hermes n'a rien renvoye."}
+        time.sleep(0.4)
+    return {"ok": False, "reply": "Hermes met trop de temps a repondre, reessaie."}
+
+
 # --- La page (statique, mobile d'abord ; les donnees arrivent via /api/state) -
 PAGE = """<!DOCTYPE html>
 <html lang="fr">
@@ -456,6 +499,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._envoyer(200, json.dumps(poser_consigne(corps)))
             if p == "/api/stop":
                 return self._envoyer(200, json.dumps(basculer_pause(corps.strip() == "on")))
+            if p == "/siri":
+                # Mains-libres iPhone : jeton dans l'en-tete X-Siri-Token. La question
+                # arrive soit en texte brut, soit en JSON {"text": "..."} (selon le Raccourci).
+                if SIRI_TOKEN and self.headers.get("X-Siri-Token", "") != SIRI_TOKEN:
+                    return self._envoyer(401, json.dumps({"ok": False, "reply": "non autorise"}))
+                texte = corps
+                if corps[:1] in ("{", "[") or "json" in self.headers.get("Content-Type", "").lower():
+                    try:
+                        j = json.loads(corps)
+                        if isinstance(j, dict):
+                            texte = j.get("text") or j.get("q") or j.get("input") or corps
+                    except Exception:
+                        pass
+                return self._envoyer(200, json.dumps(hermes_siri(texte)))
         except Exception as e:
             return self._envoyer(200, json.dumps({"ok": False, "message": f"Erreur: {e}"}))
         return self._envoyer(404, json.dumps({"ok": False, "message": "inconnu"}))
