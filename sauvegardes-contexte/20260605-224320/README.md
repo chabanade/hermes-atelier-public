@@ -133,10 +133,7 @@ La stack est conçue pour être répliquée. Sur un nouveau serveur, il faut :
 | Sas root + sas Hostinger | ✅ |
 | Tableau de bord permanent | ✅ |
 | Garde de nuit (alertes + briefing Telegram) | ✅ |
-| Salle de contrôle web (page privée : voir les ouvriers, déposer un ordre, pause) | ✅ |
-| La voix — Telegram (vocal + texte), page web, Siri mains-libres | ✅ opérationnel (voix FR masculine + voix JARVIS à la demande, 100 % local) |
-| Vocal temps réel WebRTC (parler en direct, comme un appel) | 🟠 plomberie + TURN posés, à brancher sur les moteurs |
-| Méthode de travail ARTS (l'ouvrier teste avant de livrer, Hermès vérifie le résultat) | ✅ |
+| La voix (STT/TTS, WebRTC, TURN) | 🟠 plomberie posée, à finir + tester |
 | Délégation autonome (Hermès découpe seul) | 🟡 déjà bien avancé, à affiner |
 
 ---
