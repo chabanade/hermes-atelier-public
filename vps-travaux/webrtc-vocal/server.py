@@ -231,6 +231,18 @@ def ice_servers_public(servers: list) -> list:
     return out
 
 
+def ice_servers_redacted(servers: list) -> list:
+    """Comme ice_servers_public mais SANS le secret : le mot de passe TURN est
+    masqué (« *** »). À utiliser pour les endpoints de diagnostic (/diag), qui
+    ne doivent JAMAIS exposer le credential. Le credential n'a sa place que dans
+    /ice — le navigateur en a besoin pour se connecter au relais TURN."""
+    out = ice_servers_public(servers)
+    for entry in out:
+        if entry.get("credential"):
+            entry["credential"] = "***"
+    return out
+
+
 # Liste ICE construite une fois (mêmes serveurs pour le serveur aiortc et, via
 # /ice, pour le navigateur). Recalculée par les tests qui modifient l'env.
 ICE_SERVERS = build_ice_servers()
@@ -1232,7 +1244,7 @@ async def diag(request: web.Request) -> web.Response:
     return web.json_response({
         "service": "webrtc-vocal",
         "global": GLOBAL,
-        "ice_servers": ice_servers_public(ICE_SERVERS),
+        "ice_servers": ice_servers_redacted(ICE_SERVERS),
         "config": {
             "vad_backend": VAD_BACKEND,
             "end_silence_ms": END_SILENCE_MS,

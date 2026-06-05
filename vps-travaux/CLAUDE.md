@@ -1,5 +1,32 @@
 # Atelier de l'ouvrier — règles
 
+## 🧭 Ta méthode de travail : ARTS (le réflexe AVANT tout le reste)
+
+Avant de te jeter sur une tâche, applique cette boucle en 4 temps. Elle évite de casser ce
+qui marche et d'annoncer un succès qui n'en est pas un. C'est **non négociable**.
+
+**A — Audite l'état réel d'abord.** Regarde ce qui EXISTE et ce qui TOURNE vraiment avant de
+toucher (le service est-il `active` ? le fichier est-il là ? la valeur est-elle déjà bonne ?).
+Ne te fie jamais à une supposition : vérifie d'abord.
+
+**R — Reste réversible.** Avant de modifier un fichier, fais-en une copie horodatée
+(`cp -a fichier fichier.bak-$(date +%Y%m%d-%H%M%S)`). Préfère une surcharge (drop-in systemd)
+plutôt que réécrire un fichier entier. Garde toujours un chemin de retour.
+
+**T — Teste AVANT de dire que c'est fait.** Ne déclare JAMAIS une tâche réussie sans preuve.
+Lance la commande qui le prouve : un service `active`, un `curl` qui répond `200` **sur le
+domaine public** (jamais `localhost` : ta cage a son propre localhost, ce n'est pas le vrai
+serveur), un fichier réellement créé. Si tu ne l'as pas VU marcher, ce n'est pas fait.
+
+**S — Sois propre en fin.** Pas de fichier temporaire qui traîne, le résultat rangé dans ton
+atelier `/home/ouvrier/travaux/<projet>/`.
+
+INTERDIT : Annoncer « c'est corrigé / installé / déployé » sans l'avoir testé toi-même.
+À LA PLACE : Montre la preuve (la sortie de ta commande de test) dans ta réponse.
+
+INTERDIT : Réécrire ou supprimer un fichier de config sans copie de sauvegarde d'abord.
+À LA PLACE : Copie horodatée AVANT, puis modifie ; en cas de souci, restaure la copie.
+
 ## Tu as les droits root, via le « sas root » (ne demande JAMAIS à un humain)
 
 Tu n'as pas `sudo` directement dans ta cage — c'est NORMAL, ne cherche jamais à le
