@@ -28,6 +28,14 @@ while IFS= read -r f; do [ -n "$f" ] && rm -rf "$f" && n=$((n+1)); done < <(
 while IFS= read -r f; do [ -n "$f" ] && rm -f "$f" && n=$((n+1)); done < <(
   find "$DONE" -maxdepth 1 -type f -mtime +"$JOURS_DONE" 2>/dev/null)
 
+# 4) boite vocale partagee (inbox/outbox du pont Hermes) : un message vocal vit
+#    quelques secondes -> tout .json de +1 h est un orphelin (consommateur parti).
+VOCDATA=${MA_VOCDATA:-/home/ouvrier/travaux/webrtc-vocal/data}
+for sub in inbox outbox; do
+  while IFS= read -r f; do [ -n "$f" ] && rm -f "$f" && n=$((n+1)); done < <(
+    find "$VOCDATA/$sub" -maxdepth 1 -type f -name '*.json' -mmin +60 2>/dev/null)
+done
+
 printf '%s\tmenage : %s element(s) supprime(s) (regle : out>%sj, done>%sj, live>%sh)\n' \
   "$(date -Is)" "$n" "$JOURS_OUT" "$JOURS_DONE" "$HEURES_LIVE" >> "$LOG" 2>/dev/null
 echo "menage termine : $n element(s) supprime(s)."

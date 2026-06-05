@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes Voc Bot (facade voix Telegram : vocal+texte -> Hermes -> texte+note vocale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ouvrier
+WorkingDirectory=/home/ouvrier/travaux/hermes-voc-bot
+ExecStart=/home/ouvrier/travaux/hermes-voc-bot/.venv/bin/python /home/ouvrier/travaux/hermes-voc-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

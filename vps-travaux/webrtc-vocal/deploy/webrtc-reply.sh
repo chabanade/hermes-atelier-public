@@ -41,7 +41,9 @@ DATA_DIR="${WEBRTC_DATA_DIR:-/opt/data/webrtc-vocal}"
 INBOX_DIR="$DATA_DIR/inbox"
 OUTBOX_DIR="$DATA_DIR/outbox"
 INTERVAL="${WEBRTC_POLL_INTERVAL:-1}"
-HERMES_BIN="${HERMES_BIN:-hermes}"
+HERMES_BIN="${HERMES_BIN:-/opt/hermes/hermes}"
+HERMES_CONTAINER="${HERMES_CONTAINER:-hermes}"
+HERMES_CLI_TIMEOUT="${HERMES_CLI_TIMEOUT:-75}"
 HERMES_URL="${HERMES_URL:-}"
 PROMPT_PREFIX="${HERMES_PROMPT_PREFIX:-réponds en français, de façon concise et orale, à : }"
 HTTP_TIMEOUT="${HERMES_HTTP_TIMEOUT:-55}"
@@ -76,8 +78,11 @@ generate_reply() {
          "$HERMES_URL" \
       | jq -r '.reply // .text // .response // .content // empty'
   else
-    # Mode CLI : `hermes ask "<prompt>"`.
-    "$HERMES_BIN" ask "$prompt"
+    # Mode CLI : Hermès tourne dans le conteneur Docker « $HERMES_CONTAINER ».
+    # On l'invoque en one-shot via -z (réponse « soul-aware » sur stdout). Ce démon
+    # tourne en root -> `docker exec` est permis. (L'ancien `hermes ask` n'était PAS
+    # une sous-commande valide -> toutes les réponses tombaient en repli : bug corrigé.)
+    timeout "$HERMES_CLI_TIMEOUT" docker exec "$HERMES_CONTAINER" "$HERMES_BIN" -z "$prompt" 2>/dev/null
   fi
 }
 
@@ -118,6 +123,12 @@ process_one() {
   jq -nc --arg sid "$id" --arg reply "$reply" \
      '{session_id:$sid, reply:$reply, status:"done"}' > "$tmp"
   mv -f -- "$tmp" "$outfile"
+  # Le consommateur (serveur web + bot Telegram) tourne en « ouvrier » : la réponse
+  # doit LUI APPARTENIR (lecture + suppression), tout en restant privée (pas
+  # world-readable). On la donne à ouvrier en 600. (Avant : 644 root = soit
+  # illisible par ouvrier, soit lisible par tous — les deux étaient mauvais.)
+  chown ouvrier:ouvrier -- "$outfile" 2>/dev/null
+  chmod 600 -- "$outfile" 2>/dev/null
   log "tour $id : réponse écrite (${#reply} car.) → $outfile"
 
   # Inbox traité → supprimé (l'outbox étant déjà posé, rien n'est perdu).

@@ -1,36 +1,38 @@
 #!/usr/bin/env python3
 """
-Hermes Voc Bot — pont Telegram ↔ Speaches (STT local, français) ↔ Hermès.
+Hermes Voc Bot — façade VOIX Telegram pour Hermès (l'assistant).
 
-Flux :
-  1. Reçoit un message vocal (ou audio) Telegram.
-  2. Télécharge le fichier audio (.ogg pour les vocaux Telegram).
-  3. L'envoie à Speaches (API OpenAI-compatible /v1/audio/transcriptions).
-  4. Dépose la transcription dans INBOX_DIR sous forme de JSON « pending » :
-     Hermès (l'assistant) lit ce fichier, réfléchit, puis renvoie sa réponse
-     en POSTant sur l'endpoint HTTP /reply de ce bot.
-  5. Répond « 🧠 Hermes réfléchit… » à l'utilisateur (accusé de réception).
-  6. Archive aussi la transcription brute dans TRANSCRIPTS_DIR.
+Mehdi parle (note vocale) OU écrit (dictée Siri / clavier) à @ermes_Voc_bot ;
+Hermès lui répond en TEXTE **et** en NOTE VOCALE.
 
-Endpoint HTTP local (aiohttp, port 8080 par défaut, bind 127.0.0.1) :
-  • POST /reply  { "chat_id": ..., "text": "réponse de Hermès" }
-                 → envoie le texte au chat via l'API Telegram.
-  • GET  /health → sonde de vivacité.
+Architecture (réutilise ce qui marche déjà, ne touche NI Hermès NI l'aiguilleur) :
+  1. Telegram -> on récupère le message (vocal -> OGG, ou texte brut).
+  2. Si vocal : transcription locale via Speaches (faster-whisper, FR).
+  3. On dépose le texte dans la BOÎTE PARTAGÉE d'Hermès
+     (WEBRTC_DATA_DIR/inbox/<id>.json, status=pending) — exactement comme la
+     page web. Le pont `webrtc-reply.sh` (déjà actif, scrute toutes les 1 s)
+     appelle Hermès et écrit la réponse dans .../outbox/<id>.json.
+  4. On attend la réponse (poll de l'outbox), puis on l'envoie à Mehdi :
+       • en TEXTE (toujours, fiable, relisible) ;
+       • en NOTE VOCALE : Piper (synth.py) -> WAV -> ffmpeg -> OGG/Opus -> sendVoice.
+  5. La synthèse échoue ? On a déjà envoyé le texte : on dégrade en douceur.
 
-Pas de ffmpeg : Speaches accepte directement l'ogg/opus de Telegram.
+Sécurité : le bot ne répond qu'au chat autorisé (ALLOWED_CHAT_ID = Mehdi).
+Tout est local (RGPD) : STT et TTS tournent sur le VPS, rien ne sort vers un tiers.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import sys
-from datetime import datetime
+import time
+import uuid
 from pathlib import Path
 
 import httpx
-from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -43,75 +45,91 @@ from telegram.ext import (
 )
 
 # --------------------------------------------------------------------------- #
-# Configuration (tout est surchargeable via .env / variables d'environnement)
+# Configuration (surchargeable via .env / environnement)
 # --------------------------------------------------------------------------- #
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
 def load_telegram_token() -> str:
-    """Token Telegram.
-
-    Priorité à BOT_TOKEN_B64 (token encodé en base64, passé par l'environnement
-    au lancement) ; à défaut, TELEGRAM_TOKEN en clair (typiquement via .env).
-    """
     b64 = os.environ.get("BOT_TOKEN_B64", "").strip()
     if b64:
         try:
             return base64.b64decode(b64).decode().strip()
         except Exception:
-            logging.getLogger("hermes-voc-bot").error(
-                "BOT_TOKEN_B64 présent mais indécodable ; repli sur TELEGRAM_TOKEN."
-            )
+            logging.getLogger("hermes-voc-bot").error("BOT_TOKEN_B64 indécodable ; repli TELEGRAM_TOKEN.")
     return os.environ.get("TELEGRAM_TOKEN", "").strip()
 
 
 TELEGRAM_TOKEN = load_telegram_token()
-SPEACHES_URL = os.environ.get("SPEACHES_URL", "http://speaches:8000").rstrip("/")
+
+# STT (Speaches). Le bot tourne sur l'HÔTE -> 127.0.0.1:8000 (et non speaches:8000
+# qui n'existe que dans le réseau Docker).
+SPEACHES_URL = os.environ.get("SPEACHES_URL", "http://127.0.0.1:8000").rstrip("/")
 SPEACHES_MODEL = os.environ.get("SPEACHES_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
 LANGUAGE = os.environ.get("LANGUAGE", "fr")
-TRANSCRIPTS_DIR = Path(os.environ.get("TRANSCRIPTS_DIR", BASE_DIR / "transcripts"))
-INBOX_DIR = Path(os.environ.get("INBOX_DIR", BASE_DIR / "inbox"))
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "180"))
-READY_CHAT_ID = os.environ.get("READY_CHAT_ID", "").strip()  # ping de démarrage facultatif
 
-# Endpoint HTTP /reply : par défaut on n'écoute QUE sur la loopback, car Hermès
-# tourne sur la même machine. Ne PAS exposer 0.0.0.0 sans authentification :
-# /reply peut envoyer un message arbitraire à n'importe quel chat.
-HTTP_HOST = os.environ.get("HTTP_HOST", "127.0.0.1").strip()
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-# Jeton partagé facultatif : si renseigné, /reply exige l'en-tête X-Auth-Token.
-REPLY_AUTH_TOKEN = os.environ.get("REPLY_AUTH_TOKEN", "").strip()
+# Boîte PARTAGÉE avec le pont Hermès (webrtc-reply.sh scrute inbox/, écrit outbox/).
+DATA_DIR = Path(os.environ.get("WEBRTC_DATA_DIR", "/home/ouvrier/travaux/webrtc-vocal/data"))
+INBOX_DIR = DATA_DIR / "inbox"
+OUTBOX_DIR = DATA_DIR / "outbox"
 
-READY_MESSAGE = "Bot vocal prêt ✅"
-THINKING_MESSAGE = "🧠 Hermes réfléchit…"
-TELEGRAM_MSG_LIMIT = 4096  # limite d'un message Telegram
+# TTS (Piper via synth.py one-shot) + conversion ffmpeg pour la note vocale.
+PIPER_PYTHON = os.environ.get("PIPER_PYTHON", "/home/ouvrier/travaux/webrtc-vocal/.venv/bin/python")
+SYNTH_SCRIPT = os.environ.get("SYNTH_SCRIPT", "/home/ouvrier/travaux/webrtc-vocal/synth.py")
+PIPER_VOICE = os.environ.get("PIPER_VOICE", "/home/ouvrier/travaux/webrtc-vocal/models/piper/fr_FR-upmc-medium.onnx")
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "1200"))  # on ne synthétise pas un roman
 
-# --------------------------------------------------------------------------- #
-# Logging
-# --------------------------------------------------------------------------- #
+# Combien de temps on attend la réponse d'Hermès (poll de l'outbox).
+REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", "90"))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "0.5"))
+STT_TIMEOUT = float(os.environ.get("STT_TIMEOUT", "120"))
+
+# Sécurité : on ne répond QU'à Mehdi. Vide = tout le monde (déconseillé).
+ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "VOTRE_CHAT_ID_TELEGRAM").strip()
+READY_CHAT_ID = os.environ.get("READY_CHAT_ID", "").strip()
+
+TELEGRAM_MSG_LIMIT = 4096
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-# httpx est bavard au niveau INFO (une ligne par requête) : on le calme.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("hermes-voc-bot")
 
 
 # --------------------------------------------------------------------------- #
-# Speaches : transcription
+# Helpers
+# --------------------------------------------------------------------------- #
+def autorise(update: Update) -> bool:
+    """Vrai si le message vient du chat autorisé (ou si aucun filtre n'est posé)."""
+    if not ALLOWED_CHAT_ID:
+        return True
+    chat = update.effective_chat
+    return chat is not None and str(chat.id) == ALLOWED_CHAT_ID
+
+
+async def send_chunked(bot, chat_id, text: str) -> None:
+    if not text:
+        return
+    for i in range(0, len(text), TELEGRAM_MSG_LIMIT):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text[i:i + TELEGRAM_MSG_LIMIT])
+        except Exception:
+            # Un fragment qui échoue (réseau Telegram) ne doit pas tout interrompre.
+            logger.exception("Échec d'envoi d'un fragment de réponse à %s", chat_id)
+
+
+# --------------------------------------------------------------------------- #
+# STT (Speaches)
 # --------------------------------------------------------------------------- #
 async def transcribe_audio(data: bytes, filename: str = "voice.ogg") -> str:
-    """Envoie l'audio à Speaches et renvoie le texte transcrit (peut être vide)."""
     url = f"{SPEACHES_URL}/v1/audio/transcriptions"
     files = {"file": (filename, data, "audio/ogg")}
-    form = {
-        "model": SPEACHES_MODEL,
-        "language": LANGUAGE,
-        "response_format": "json",
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT)) as client:
+    form = {"model": SPEACHES_MODEL, "language": LANGUAGE, "response_format": "json"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(STT_TIMEOUT)) as client:
         resp = await client.post(url, files=files, data=form)
         resp.raise_for_status()
         payload = resp.json()
@@ -119,324 +137,238 @@ async def transcribe_audio(data: bytes, filename: str = "voice.ogg") -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Inbox Hermès : dépôt de la transcription pour traitement par l'assistant
+# Pont Hermès : écrire l'inbox partagée, attendre la réponse dans l'outbox
 # --------------------------------------------------------------------------- #
-def write_inbox(
-    text: str,
-    *,
-    chat_id: int,
-    user_id: int | None,
-    message_id: int,
-    user: str,
-    source: str,
-) -> Path:
-    """Dépose la transcription dans INBOX_DIR sous forme de JSON « pending ».
-
-    Écriture atomique (fichier temporaire + os.replace) pour qu'Hermès ne lise
-    jamais un fichier partiellement écrit.
-    """
+def _ecrire_inbox(session_id: str, text: str, chat_id: int) -> None:
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
-    record = {
-        "ts": now.isoformat(timespec="seconds"),
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "text": text,
-        "status": "pending",
-        # --- contexte additionnel, utile à Hermès pour répondre ---
-        "message_id": message_id,
-        "user": user,
-        "source": source,
-    }
-    name = f"{now:%Y-%m-%d_%H-%M-%S}_chat{chat_id}_msg{message_id}.json"
-    path = INBOX_DIR / name
-    tmp = INBOX_DIR / (name + ".tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)  # atomique sur le même système de fichiers
-    return path
+    record = {"session_id": session_id, "text": text, "status": "pending",
+              "source": "telegram", "chat_id": chat_id}
+    path = INBOX_DIR / f"{session_id}.json"
+    tmp = INBOX_DIR / f".{session_id}.json.tmp"
+    tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)  # atomique : webrtc-reply ne voit jamais un demi-fichier
+
+
+async def demander_a_hermes(text: str, chat_id: int) -> str | None:
+    """Dépose le texte pour Hermès et attend sa réponse. None si délai dépassé."""
+    session_id = f"tg-{chat_id}-{uuid.uuid4().hex[:8]}"
+    await asyncio.to_thread(_ecrire_inbox, session_id, text, chat_id)
+    outfile = OUTBOX_DIR / f"{session_id}.json"
+    deadline = time.monotonic() + REPLY_TIMEOUT
+    while time.monotonic() < deadline:
+        if outfile.exists():
+            try:
+                data = json.loads(outfile.read_text(encoding="utf-8"))
+            except Exception:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            reply = (data.get("reply") or "").strip()
+            try:
+                outfile.unlink()  # ménage : on retire l'outbox lu
+            except Exception:
+                pass
+            return reply
+        await asyncio.sleep(POLL_INTERVAL)
+    return None
 
 
 # --------------------------------------------------------------------------- #
-# Transcripts : archivage horodaté (canal secondaire, séparé de l'inbox)
+# TTS : texte -> note vocale (Piper one-shot -> WAV -> ffmpeg -> OGG/Opus)
 # --------------------------------------------------------------------------- #
-def save_transcript(
-    text: str,
-    *,
-    user: str,
-    chat_id: int,
-    message_id: int,
-    duration: int | None,
-    source: str,
-) -> Path:
-    """Écrit la transcription dans un fichier .txt horodaté et renvoie son chemin."""
-    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
-    name = f"{now:%Y-%m-%d_%H-%M-%S}_chat{chat_id}_msg{message_id}.txt"
-    path = TRANSCRIPTS_DIR / name
-    header = (
-        f"date       : {now.isoformat(timespec='seconds')}\n"
-        f"user       : {user}\n"
-        f"chat_id    : {chat_id}\n"
-        f"message_id : {message_id}\n"
-        f"source     : {source}\n"
-        f"duration_s : {duration if duration is not None else '?'}\n"
-        f"model      : {SPEACHES_MODEL}\n"
-        f"language   : {LANGUAGE}\n"
-        f"{'-' * 50}\n\n"
+async def _run(cmd: list[str], stdin: bytes | None = None, timeout: float = 60) -> tuple[int, bytes, bytes]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    path.write_text(header + text + "\n", encoding="utf-8")
-    return path
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, b"", b"timeout"
+    return proc.returncode, out, err
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-async def send_chunked(bot, chat_id, text: str) -> None:
-    """Envoie `text` à `chat_id`, découpé pour respecter la limite Telegram."""
+async def synthetiser_ogg(text: str) -> Path | None:
+    """Renvoie un OGG/Opus prêt pour sendVoice, ou None si la synthèse échoue."""
+    text = text.strip()[:TTS_MAX_CHARS]
     if not text:
-        return
-    for i in range(0, len(text), TELEGRAM_MSG_LIMIT):
-        await bot.send_message(chat_id=chat_id, text=text[i : i + TELEGRAM_MSG_LIMIT])
-
-
-def describe_user(update: Update) -> str:
-    u = update.effective_user
-    if u is None:
-        return "inconnu"
-    handle = f"@{u.username}" if u.username else ""
-    return f"{u.full_name} {handle} (id={u.id})".strip()
-
-
-# --------------------------------------------------------------------------- #
-# Endpoint HTTP local (aiohttp) : Hermès POSTe ses réponses ici
-# --------------------------------------------------------------------------- #
-async def handle_reply(request: web.Request) -> web.Response:
-    """POST /reply { chat_id, text } → envoie le texte au chat via Telegram."""
-    if REPLY_AUTH_TOKEN and request.headers.get("X-Auth-Token") != REPLY_AUTH_TOKEN:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-
+        return None
+    uid = uuid.uuid4().hex[:10]
+    wav = Path(f"/tmp/voc-{uid}.wav")
+    ogg = Path(f"/tmp/voc-{uid}.ogg")
     try:
-        payload = await request.json()
+        rc, _out, err = await _run(
+            [PIPER_PYTHON, SYNTH_SCRIPT, "--out", str(wav), "--voice", PIPER_VOICE],
+            stdin=text.encode("utf-8"), timeout=90,
+        )
+        if rc != 0 or not wav.exists() or wav.stat().st_size == 0:
+            logger.warning("Synthèse Piper échouée (rc=%s) : %s", rc, err[:200])
+            return None
+        rc, _out, err = await _run(
+            [FFMPEG_BIN, "-y", "-i", str(wav), "-c:a", "libopus", "-b:a", "48k",
+             "-ar", "48000", str(ogg)], timeout=60,
+        )
+        if rc != 0 or not ogg.exists() or ogg.stat().st_size == 0:
+            logger.warning("Conversion ffmpeg échouée (rc=%s) : %s", rc, err[:200])
+            return None
+        return ogg
     except Exception:
-        return web.json_response({"ok": False, "error": "corps JSON invalide"}, status=400)
-
-    chat_id = payload.get("chat_id")
-    text = payload.get("text")
-    # chat_id : entier (id) ou chaîne (@canal) ; text : non vide.
-    if chat_id is None or not isinstance(chat_id, (int, str)):
-        return web.json_response({"ok": False, "error": "chat_id requis (int ou str)"}, status=400)
-    if not isinstance(text, str) or not text.strip():
-        return web.json_response({"ok": False, "error": "text requis (chaîne non vide)"}, status=400)
-
-    bot = request.app["tg_app"].bot
-    try:
-        await send_chunked(bot, chat_id, text)
-    except Exception as exc:
-        logger.exception("Échec de l'envoi de la réponse Hermès à chat_id=%s", chat_id)
-        return web.json_response({"ok": False, "error": str(exc)}, status=502)
-
-    logger.info("Réponse Hermès envoyée à chat_id=%s (%d car.)", chat_id, len(text))
-    return web.json_response({"ok": True, "sent_chars": len(text)})
+        logger.exception("Erreur de synthèse vocale")
+        return None
+    finally:
+        try:
+            wav.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "hermes-voc-bot"})
+def nettoyer(ogg: Path | None) -> None:
+    if ogg is not None:
+        try:
+            ogg.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-async def start_http_server(application: Application) -> None:
-    """Démarre le serveur aiohttp dans la boucle asyncio de PTB."""
-    http_app = web.Application()
-    http_app["tg_app"] = application
-    http_app.add_routes(
-        [
-            web.post("/reply", handle_reply),
-            web.get("/health", handle_health),
-        ]
-    )
-    runner = web.AppRunner(http_app)
-    await runner.setup()
-    site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
-    await site.start()
-    application.bot_data["http_runner"] = runner
-    logger.info(
-        "Endpoint HTTP en écoute sur http://%s:%s  (POST /reply, GET /health)",
-        HTTP_HOST, HTTP_PORT,
-    )
+# --------------------------------------------------------------------------- #
+# Cœur : traiter un texte (venant d'un vocal OU d'un message texte)
+# --------------------------------------------------------------------------- #
+async def traiter_et_repondre(update: Update, context: ContextTypes.DEFAULT_TYPE, texte_entree: str) -> None:
+    message = update.message
+    chat_id = message.chat_id
 
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+    reply = await demander_a_hermes(texte_entree, chat_id)
 
-async def stop_http_server(application: Application) -> None:
-    runner = application.bot_data.pop("http_runner", None)
-    if runner is not None:
-        await runner.cleanup()
-        logger.info("Endpoint HTTP arrêté.")
+    if reply is None:
+        await message.reply_text("⏳ Hermès met un peu de temps à répondre — réessaie dans un instant.")
+        return
+    if not reply:
+        await message.reply_text("🤔 Hermès n'a rien renvoyé cette fois. Reformule peut-être ?")
+        return
+
+    # 1) Toujours le texte (fiable, relisible).
+    await send_chunked(context.bot, chat_id, reply)
+
+    # 2) Puis la note vocale (dégradation douce si la synthèse échoue).
+    ogg = await synthetiser_ogg(reply)
+    if ogg is not None:
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+            with ogg.open("rb") as f:
+                await context.bot.send_voice(chat_id=chat_id, voice=f)
+        except Exception:
+            logger.exception("Échec de l'envoi de la note vocale (le texte est déjà parti).")
+        finally:
+            nettoyer(ogg)
 
 
 # --------------------------------------------------------------------------- #
 # Handlers Telegram
 # --------------------------------------------------------------------------- #
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"{READY_MESSAGE}\n\n"
-        "Envoie-moi un *message vocal* : je le transcris, puis Hermès te répond. 🎙️🧠",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🎙️ *Hermes Voc Bot*\n\n"
-        "• Envoie un message vocal → je le transcris (français) et le transmets à Hermès.\n"
-        "• Hermès réfléchit, puis sa réponse t'est renvoyée ici.\n"
-        "• Les transcriptions sont aussi archivées côté serveur.\n\n"
-        "Commandes : /start /help",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toute réponse à un message texte : confirme que le bot est en ligne."""
-    await update.message.reply_text(
-        f"{READY_MESSAGE} — envoie-moi un message vocal 🎙️"
-    )
-
-
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorise(update):
+        return
     message = update.message
     media = message.voice or message.audio
     if media is None:
         return
-
-    source = "voice" if message.voice else "audio"
-    user = describe_user(update)
-    logger.info("Vocal reçu de %s (chat=%s, %ss)", user, message.chat_id, getattr(media, "duration", "?"))
-
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-
-    # 1-2. Téléchargement du fichier audio Telegram
     try:
         tg_file = await context.bot.get_file(media.file_id)
         audio = bytes(await tg_file.download_as_bytearray())
     except Exception:
-        logger.exception("Échec du téléchargement de l'audio")
-        await message.reply_text("⚠️ Impossible de récupérer ton audio. Réessaie, s'il te plaît.")
+        logger.exception("Échec téléchargement audio")
+        await message.reply_text("⚠️ Impossible de récupérer ton audio. Réessaie.")
         return
-
-    # 3. Transcription via Speaches
     try:
-        text = await transcribe_audio(audio, filename=f"{source}.ogg")
+        texte = await transcribe_audio(audio, filename="voice.ogg")
     except httpx.HTTPStatusError as exc:
-        body = exc.response.text[:300]
-        logger.error("Speaches a renvoyé HTTP %s : %s", exc.response.status_code, body)
-        await message.reply_text(
-            "⚠️ La transcription a échoué (erreur du service STT). Réessaie dans un instant."
-        )
+        logger.error("Speaches HTTP %s : %s", exc.response.status_code, exc.response.text[:200])
+        await message.reply_text("⚠️ La transcription a échoué (service STT). Réessaie dans un instant.")
         return
     except httpx.RequestError as exc:
-        logger.error("Speaches injoignable (%s) : %r", SPEACHES_URL, exc)
-        await message.reply_text(
-            "⚠️ Service de transcription injoignable pour le moment. Réessaie bientôt. 🙏"
-        )
+        logger.error("Speaches injoignable : %r", exc)
+        await message.reply_text("⚠️ Service de transcription injoignable. Réessaie bientôt. 🙏")
         return
     except Exception:
-        logger.exception("Erreur inattendue pendant la transcription")
-        await message.reply_text("⚠️ Une erreur est survenue pendant la transcription.")
+        logger.exception("Erreur transcription")
+        await message.reply_text("⚠️ Erreur pendant la transcription.")
         return
-
-    # Audio vide / silencieux
-    if not text:
+    if not texte:
         await message.reply_text("🤔 Je n'ai rien entendu d'intelligible (audio vide ou silencieux).")
         return
+    logger.info("Vocal transcrit (%d car.), envoi à Hermès.", len(texte))
+    await traiter_et_repondre(update, context, texte)
 
-    # Archivage de la transcription brute (ne doit jamais bloquer la suite)
-    try:
-        path = save_transcript(
-            text,
-            user=user,
-            chat_id=message.chat_id,
-            message_id=message.message_id,
-            duration=getattr(media, "duration", None),
-            source=source,
-        )
-        logger.info("Transcription archivée : %s", path)
-    except Exception:
-        logger.exception("Impossible d'écrire la transcription sur disque")
 
-    # 4. Dépôt dans l'inbox Hermès (l'assistant lira ce JSON et répondra via /reply).
-    #    Si ce dépôt échoue, l'utilisateur n'aurait aucune réponse : on le prévient.
-    try:
-        inbox_path = write_inbox(
-            text,
-            chat_id=message.chat_id,
-            user_id=update.effective_user.id if update.effective_user else None,
-            message_id=message.message_id,
-            user=user,
-            source=source,
-        )
-        logger.info("Vocal déposé dans l'inbox Hermès : %s", inbox_path)
-    except Exception:
-        logger.exception("Impossible d'écrire le message dans l'inbox Hermès")
-        await message.reply_text(
-            "⚠️ Transcription faite mais impossible de la transmettre à Hermès. Réessaie."
-        )
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Message texte (dictée Siri / clavier) -> traité comme une question à Hermès."""
+    if not autorise(update):
         return
+    texte = (update.message.text or "").strip()
+    if not texte:
+        return
+    logger.info("Texte reçu (%d car.), envoi à Hermès.", len(texte))
+    await traiter_et_repondre(update, context, texte)
 
-    # 5. Accusé de réception : Hermès prend le relais.
-    await message.reply_text(THINKING_MESSAGE)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorise(update):
+        return
+    await update.message.reply_text(
+        "Bot vocal d'Hermès prêt ✅\n\n"
+        "Parle-moi (note vocale) ou écris-moi (dictée Siri, clavier) : "
+        "Hermès te répond en texte ET en voix. 🎙️🧠"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not autorise(update):
+        return
+    await update.message.reply_text(
+        "🎙️ Hermes Voc Bot\n\n"
+        "• Note vocale → je transcris (français) et Hermès répond en texte + voix.\n"
+        "• Message texte (dictée Siri) → Hermès répond en texte + voix.\n"
+        "• Tout est local (RGPD) : transcription et voix sur le serveur.\n\n"
+        "Commandes : /start /help"
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception non gérée dans un handler", exc_info=context.error)
+    logger.error("Exception non gérée", exc_info=context.error)
 
 
 # --------------------------------------------------------------------------- #
-# Démarrage / arrêt
+# Démarrage
 # --------------------------------------------------------------------------- #
 async def on_startup(app: Application) -> None:
     me = await app.bot.get_me()
-    logger.info(
-        "Bot @%s (id=%s) en ligne | Speaches=%s | model=%s | langue=%s | inbox=%s | transcripts=%s",
-        me.username, me.id, SPEACHES_URL, SPEACHES_MODEL, LANGUAGE, INBOX_DIR, TRANSCRIPTS_DIR,
-    )
-    await start_http_server(app)
+    logger.info("Bot @%s (id=%s) en ligne | STT=%s | inbox=%s | chat autorisé=%s",
+                me.username, me.id, SPEACHES_URL, INBOX_DIR, ALLOWED_CHAT_ID or "tous")
     if READY_CHAT_ID:
         try:
-            await app.bot.send_message(chat_id=READY_CHAT_ID, text=READY_MESSAGE)
-            logger.info("Ping de démarrage « %s » envoyé à %s", READY_MESSAGE, READY_CHAT_ID)
+            await app.bot.send_message(chat_id=READY_CHAT_ID, text="Bot vocal d'Hermès prêt ✅")
         except Exception:
-            logger.exception("Échec du ping de démarrage vers %s", READY_CHAT_ID)
-
-
-async def on_shutdown(app: Application) -> None:
-    await stop_http_server(app)
+            logger.exception("Échec ping de démarrage")
 
 
 def main() -> None:
     if not TELEGRAM_TOKEN:
-        logger.error(
-            "Token Telegram manquant : renseigne TELEGRAM_TOKEN dans %s/.env "
-            "ou exporte BOT_TOKEN_B64 (token en base64).",
-            BASE_DIR,
-        )
+        logger.error("Token Telegram manquant (TELEGRAM_TOKEN dans %s/.env).", BASE_DIR)
         sys.exit(1)
-
-    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(on_startup)
-        .post_shutdown(on_shutdown)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
 
     logger.info("Démarrage du polling Telegram…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
