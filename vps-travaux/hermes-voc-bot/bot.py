@@ -81,12 +81,12 @@ PIPER_VOICE = os.environ.get("PIPER_VOICE", "/home/ouvrier/travaux/webrtc-vocal/
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "1200"))  # on ne synthétise pas un roman
 
-# Voix JARVIS « à la demande » : convertisseur RVC dans son propre venv (Python 3.10).
-# Lent (~25 s/phrase sur CPU) -> n'est utilisé QUE si le chat est passé en mode jarvis.
+# Voix JARVIS (RVC) ABANDONNEE le 06/06 : ~25 s/phrase sur CPU sans GPU = trop lent, et timbre
+# masculin non retenu. Constantes laissees en sommeil ; le code est neutralise (jarvis force a False).
 RVC_PYTHON = os.environ.get("RVC_PYTHON", "/home/ouvrier/travaux/rvc-jarvis/.venv/bin/python")
 RVC_CONVERT = os.environ.get("RVC_CONVERT", "/home/ouvrier/travaux/rvc-jarvis/jarvis_convert.py")
 RVC_TIMEOUT = float(os.environ.get("RVC_TIMEOUT", "150"))
-# Mode de voix par chat : "tom" (rapide, défaut) ou "jarvis" (timbre JARVIS, lent).
+# Une seule voix desormais : jessica (upmc, feminine). MODE_VOIX n'est plus utilise.
 MODE_VOIX = {}
 
 # Combien de temps on attend la réponse d'Hermès (poll de l'outbox).
@@ -125,13 +125,8 @@ def detecter_mode(texte: str, chat_id: int) -> str | None:
     t = (texte or "").lower()
     if any(k in t for k in ("mode jarvis", "voix jarvis", "en jarvis", "passe en jarvis",
                             "parle comme jarvis", "comme jarvis")):
-        MODE_VOIX[chat_id] = "jarvis"
-        return ("🎩 Mode JARVIS activé : mes réponses vocales prendront son timbre "
-                "(un peu plus lentes). Dis « voix normale » pour revenir.")
-    if any(k in t for k in ("voix normale", "mode normal", "voix rapide", "voix tom",
-                            "arrête jarvis", "arrete jarvis", "stop jarvis")):
-        MODE_VOIX[chat_id] = "tom"
-        return "✅ Voix rapide rétablie."
+        return ("🎙️ La voix JARVIS a été retirée : trop lente sur ce serveur "
+                "(sans carte graphique). Je garde ma voix féminine normale, instantanée.")
     return None
 
 
@@ -273,7 +268,7 @@ def nettoyer(ogg: Path | None) -> None:
 async def traiter_et_repondre(update: Update, context: ContextTypes.DEFAULT_TYPE, texte_entree: str) -> None:
     message = update.message
     chat_id = message.chat_id
-    jarvis = MODE_VOIX.get(chat_id) == "jarvis"
+    jarvis = False  # voix JARVIS (RVC) retiree : trop lente sur CPU sans GPU (abandon 06/06)
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
     reply = await demander_a_hermes(texte_entree, chat_id)
@@ -377,26 +372,24 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Note vocale → je transcris (français) et Hermès répond en texte + voix.\n"
         "• Message texte (dictée Siri) → Hermès répond en texte + voix.\n"
         "• Tout est local (RGPD) : transcription et voix sur le serveur.\n\n"
-        "Voix : /jarvis (timbre JARVIS, plus lent) · /normal (voix rapide).\n"
-        "Commandes : /start /help /jarvis /normal"
+        "Voix : féminine, locale et instantanée (la voix JARVIS a été retirée).\n"
+        "Commandes : /start /help"
     )
 
 
 async def cmd_jarvis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not autorise(update):
         return
-    MODE_VOIX[update.effective_chat.id] = "jarvis"
     await update.message.reply_text(
-        "🎩 Mode JARVIS activé. Mes réponses vocales prendront son timbre — c'est un peu "
-        "plus lent (~15-20 s). Dis /normal (ou « voix normale ») pour revenir à la voix rapide."
+        "🎙️ La voix JARVIS a été retirée : trop lente sur ce serveur (sans carte "
+        "graphique). Je garde ma voix féminine normale, instantanée."
     )
 
 
 async def cmd_normal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not autorise(update):
         return
-    MODE_VOIX[update.effective_chat.id] = "tom"
-    await update.message.reply_text("✅ Voix rapide rétablie.")
+    await update.message.reply_text("✅ Voix féminine normale (la seule voix désormais).")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
