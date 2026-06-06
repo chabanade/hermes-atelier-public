@@ -10,7 +10,7 @@ WorkingDirectory=/home/ouvrier/travaux/hermes-voc-bot
 ExecStart=/home/ouvrier/travaux/hermes-voc-bot/.venv/bin/python /home/ouvrier/travaux/hermes-voc-bot/bot.py
 # Voix d'Hermes : masculine (tom) pour coller a sa persona « bras droit / JARVIS ».
 # Pour revenir a la voix feminine : repasser sur fr_FR-upmc-medium.onnx.
-Environment=PIPER_VOICE=/home/ouvrier/travaux/webrtc-vocal/models/piper/fr_FR-tom-medium.onnx
+Environment=PIPER_VOICE=/home/ouvrier/travaux/webrtc-vocal/models/piper/fr_FR-upmc-medium.onnx
 Restart=always
 RestartSec=5
 
