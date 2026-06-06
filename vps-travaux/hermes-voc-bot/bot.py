@@ -27,6 +27,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -207,10 +208,27 @@ async def _run(cmd: list[str], stdin: bytes | None = None, timeout: float = 60) 
     return proc.returncode, out, err
 
 
+def nettoyer_pour_voix(text: str) -> str:
+    """Retire le Markdown pour que la synthèse vocale ne lise pas les symboles
+    (« astérisque astérisque », dièses…). Le texte ÉCRIT envoyé à Mehdi garde sa
+    mise en forme ; seule la version LUE par Piper est nettoyée."""
+    t = re.sub(r"```[\s\S]*?```", " ", text)            # blocs de code
+    t = t.replace("`", "")                                # code inline
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)         # liens [texte](url) -> texte
+    t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)               # **gras**
+    t = re.sub(r"\*([^*]+)\*", r"\1", t)                   # *italique*
+    t = re.sub(r"^\s{0,3}#{1,6}\s+", "", t, flags=re.M)    # titres #
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)         # puces de liste
+    t = re.sub(r"^\s*\d+[.)]\s+", "", t, flags=re.M)       # listes numérotées
+    t = t.replace("*", "").replace("#", "")                # symboles résiduels
+    t = re.sub(r"[ \t]{2,}", " ", t)                       # espaces multiples
+    t = re.sub(r"\n{3,}", "\n\n", t)                       # lignes vides multiples
+    return t.strip()
+
+
 async def synthetiser_ogg(text: str, jarvis: bool = False) -> Path | None:
-    """Renvoie un OGG/Opus prêt pour sendVoice, ou None si la synthèse échoue.
-    Si jarvis=True : voix Piper -> conversion RVC vers le timbre JARVIS (lent)."""
-    text = text.strip()[:TTS_MAX_CHARS]
+    """Renvoie un OGG/Opus prêt pour sendVoice, ou None si la synthèse échoue."""
+    text = nettoyer_pour_voix(text.strip())[:TTS_MAX_CHARS]
     if not text:
         return None
     uid = uuid.uuid4().hex[:10]
