@@ -193,45 +193,6 @@ async def demander_a_hermes(text: str, chat_id: int) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Mémoire de conversation : le FIL court terme (AGEA reste la mémoire long terme)
-# --------------------------------------------------------------------------- #
-HISTORIQUE: dict[int, dict] = {}      # {chat_id: {"ts": float, "tours": [(role, texte), ...]}}
-HIST_MAX_TOURS = 6                     # nombre d'échanges (Mehdi+Hermès) gardés
-HIST_GAP_S = 30 * 60                   # >30 min sans parler -> on repart sur une conversation neuve
-HIST_MAX_CHARS = 1500                  # plafond du contexte injecté (n'alourdit pas Hermès)
-
-
-def construire_prompt_avec_contexte(chat_id: int, message: str) -> str:
-    """Préfixe le message avec le fil récent, pour qu'Hermès suive la conversation.
-    Le fil est géré ICI (rapide, borné) ; AGEA reste la mémoire long terme."""
-    h = HISTORIQUE.get(chat_id)
-    if not h or not h.get("tours") or (time.time() - h["ts"]) > HIST_GAP_S:
-        return message  # conversation neuve : rien à rappeler
-    lignes = [f"{'Mehdi' if role == 'user' else 'Toi (Hermès)'}: {txt}"
-              for role, txt in h["tours"][-(HIST_MAX_TOURS * 2):]]
-    contexte = "\n".join(lignes)
-    if len(contexte) > HIST_MAX_CHARS:
-        contexte = "…" + contexte[-HIST_MAX_CHARS:]
-    return ("(Rappel de notre conversation en cours, pour ton contexte — ne le commente "
-            "pas, sers-t'en juste pour comprendre :)\n"
-            f"{contexte}\n\n"
-            "(Nouveau message de Mehdi, réponds-y directement :)\n"
-            f"{message}")
-
-
-def memoriser_echange(chat_id: int, message: str, reply: str) -> None:
-    """Ajoute l'échange au fil ; repart à neuf si la dernière prise de parole est ancienne."""
-    h = HISTORIQUE.get(chat_id)
-    if not h or (time.time() - h["ts"]) > HIST_GAP_S:
-        h = {"ts": 0.0, "tours": []}
-    h["tours"].append(("user", message))
-    h["tours"].append(("hermes", reply))
-    h["tours"] = h["tours"][-(HIST_MAX_TOURS * 2):]
-    h["ts"] = time.time()
-    HISTORIQUE[chat_id] = h
-
-
-# --------------------------------------------------------------------------- #
 # TTS : texte -> note vocale (Piper one-shot -> WAV -> ffmpeg -> OGG/Opus)
 # --------------------------------------------------------------------------- #
 async def _run(cmd: list[str], stdin: bytes | None = None, timeout: float = 60) -> tuple[int, bytes, bytes]:
@@ -328,8 +289,9 @@ async def traiter_et_repondre(update: Update, context: ContextTypes.DEFAULT_TYPE
     jarvis = False  # voix JARVIS (RVC) retiree : trop lente sur CPU sans GPU (abandon 06/06)
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
-    prompt = construire_prompt_avec_contexte(chat_id, texte_entree)
-    reply = await demander_a_hermes(prompt, chat_id)
+    # Le fil de conversation est géré de façon CENTRALE et TRANS-CANAL par le pont
+    # (webrtc-reply.sh + contexte-conversation.py) : ce bot n'envoie que le message brut.
+    reply = await demander_a_hermes(texte_entree, chat_id)
 
     if reply is None:
         await message.reply_text("⏳ Hermès met un peu de temps à répondre — réessaie dans un instant.")
@@ -337,9 +299,6 @@ async def traiter_et_repondre(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not reply:
         await message.reply_text("🤔 Hermès n'a rien renvoyé cette fois. Reformule peut-être ?")
         return
-
-    # On garde le fil de la conversation (contexte court terme ; AGEA = mémoire long terme).
-    memoriser_echange(chat_id, texte_entree, reply)
 
     # 1) Toujours le texte (fiable, relisible).
     await send_chunked(context.bot, chat_id, reply)
