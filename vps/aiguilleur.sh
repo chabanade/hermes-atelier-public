@@ -177,11 +177,55 @@ for f in "$QUEUE/in/"*; do
     continue
   fi
 
-  # --- Bouton "effort max" : si l'ordre commence par @max -> on pousse Opus a fond
-  EFFORT_FLAG=""
-  if printf '%s' "$ORDRE" | head -1 | grep -qiE '^@max([[:space:]]|$)'; then
-    EFFORT_FLAG="--effort max"
-    ORDRE=$(printf '%s' "$ORDRE" | sed '1s/^@max[[:space:]]*//')
+  # --- EFFORT + MODELE : tags en tete (poses par la salle de controle).
+  #     @effort=low|medium|high|xhigh|max  (ou @max, alias historique de "max")
+  #     @model=claude-opus-4-8|claude-sonnet-4-6|claude-fable-5|claude-haiku-4-5
+  #     On les EPLUCHE de la 1re ligne dans N'IMPORTE QUEL ORDRE (boucle robuste :
+  #     que la salle ou un humain tape @effort puis @model ou l'inverse, ca marche),
+  #     le reste de la ligne = la mission. A defaut, niveaux PERMANENTS ecrits par
+  #     la salle (effort-defaut-vps / modele-defaut-vps), sinon rien (comme avant).
+  NIV_EFFORT=""
+  MODELE_ID=""
+  n=0
+  while [ "$n" -lt 6 ]; do            # cap a 6 : garde-fou anti-boucle (2 tags max attendus)
+    n=$((n + 1))
+    PREMIERE=$(printf '%s' "$ORDRE" | head -1)
+    if printf '%s' "$PREMIERE" | grep -qiE '^@effort=(low|medium|high|xhigh|max)([[:space:]]|$)'; then
+      NIV_EFFORT=$(printf '%s' "$PREMIERE" | sed -E '1s/^@effort=([A-Za-z]+).*/\1/' | tr 'A-Z' 'a-z')
+      ORDRE=$(printf '%s' "$ORDRE" | sed -E '1s/^@effort=[A-Za-z]+[[:space:]]*//')
+    elif printf '%s' "$PREMIERE" | grep -qiE '^@max([[:space:]]|$)'; then
+      NIV_EFFORT="max"
+      ORDRE=$(printf '%s' "$ORDRE" | sed '1s/^@max[[:space:]]*//')
+    elif printf '%s' "$PREMIERE" | grep -qiE '^@model=[A-Za-z0-9._-]+([[:space:]]|$)'; then
+      MODELE_ID=$(printf '%s' "$PREMIERE" | sed -E '1s/^@model=([A-Za-z0-9._-]+).*/\1/')
+      ORDRE=$(printf '%s' "$ORDRE" | sed -E '1s/^@model=[A-Za-z0-9._-]+[[:space:]]*//')
+    else
+      break
+    fi
+  done
+  # Defauts permanents si aucun tag correspondant n'a ete fourni.
+  if [ -z "$NIV_EFFORT" ]; then
+    DEF=$(cat /root/.hermes/effort-defaut-vps 2>/dev/null | tr -d '[:space:]')
+    case "$DEF" in low|medium|high|xhigh|max) NIV_EFFORT="$DEF";; esac
+  fi
+  if [ -z "$MODELE_ID" ]; then
+    DEFM=$(cat /root/.hermes/modele-defaut-vps 2>/dev/null | tr -d '[:space:]')
+    case "$DEFM" in claude-opus-4-8|claude-sonnet-4-6|claude-fable-5|claude-haiku-4-5) MODELE_ID="$DEFM";; esac
+  fi
+  # Garde-fou : les efforts xhigh/max n'existent que sur Opus. Avec un autre
+  # modele, on plafonne a high (sinon claude renverrait une erreur 400).
+  if [ -n "$MODELE_ID" ] && ! printf '%s' "$MODELE_ID" | grep -qi '^claude-opus'; then
+    case "$NIV_EFFORT" in xhigh|max) NIV_EFFORT="high";; esac
+  fi
+  # Drapeaux finaux passes a claude
+  EFFORT_FLAG=""; [ -n "$NIV_EFFORT" ] && EFFORT_FLAG="--effort $NIV_EFFORT"
+  MODELE_FLAG=""; [ -n "$MODELE_ID" ] && MODELE_FLAG="--model $MODELE_ID"
+
+  # --- ULTRACODE PAR DEFAUT (VPS) : regle dans la salle (fichier present = actif).
+  #     Si actif ET que la mission ne demande pas deja "ultracode", on prefixe le
+  #     mot-cle -> l'ouvrier passe en mode multi-agents pour CET ordre aussi.
+  if [ -f /root/.hermes/ultracode-defaut-vps ] && ! printf '%s' "$ORDRE" | head -1 | grep -qiw ultracode; then
+    ORDRE="ultracode $ORDRE"
   fi
 
   # --- CONSIGNES DU PATRON (Mehdi) : injectees en tete de CHAQUE mission ---------
@@ -195,7 +239,7 @@ $(cat "$CONSIGNES_PATRON")
 $ORDRE"
   fi
 
-  log "TRAITE $name (effort: ${EFFORT_FLAG:-xhigh par defaut})"
+  log "TRAITE $name (effort: ${NIV_EFFORT:-xhigh par defaut}, modele: ${MODELE_ID:-config ouvrier})"
 
   # --- Drapeaux du copilote : on repart d'une ardoise vierge pour CET ordre ---
   #     (le copilote ecrit en tant qu'ouvrier ; on vide donc en tant qu'ouvrier)
@@ -212,13 +256,17 @@ $ORDRE"
   #     Pipe en avant-plan : python (root) alimente le .live en temps reel ;
   #     PIPESTATUS[0] = code de claude (124 = timeout).
   LIVE="$QUEUE/out/$name.live"
+  # Fiche telemetrie de CET ordre (cout/duree/tokens) : posee a cote du .out et
+  # CONSERVEE (contrairement au .live qu'on efface). modele/effort = ce qui a ete
+  # demande ; le cout/duree viennent du flux de l'ouvrier (null si interrompu).
+  META="$QUEUE/out/$name.meta"
   # Repere temporel : tout fichier modifie APRES = produit pendant l'ordre (artefacts).
   MARQUEUR=$(mktemp)
   TMPRESULT=$(mktemp)
   timeout "$TIMEOUT" $RUNAS "$CAGE" claude -p "$ORDRE" \
-             --settings "$SETTINGS" --permission-mode dontAsk $EFFORT_FLAG \
+             --settings "$SETTINGS" --permission-mode dontAsk $EFFORT_FLAG $MODELE_FLAG \
              --output-format stream-json --verbose --max-turns 120 </dev/null 2>&1 \
-    | python3 "$FORMATLIVE" "$LIVE" "$TMPRESULT" "$HERMES_UID"
+    | python3 "$FORMATLIVE" "$LIVE" "$TMPRESULT" "$HERMES_UID" "$META" "$MODELE_ID" "$NIV_EFFORT" vps
   STATUS=${PIPESTATUS[0]}
   RESULT=$(cat "$TMPRESULT" 2>/dev/null); rm -f "$TMPRESULT"
   [ "$STATUS" = 124 ] && RESULT="[AIGUILLEUR] Ordre interrompu : depassement du delai de 60 min."
