@@ -141,5 +141,5 @@ La stack est conçue pour être répliquée. Sur un nouveau serveur, il faut :
 
 ---
 
-*Stack développée par Mehdi (une PME) avec l'aide de Claude. Partagée avec
+*Stack développée par Mehdi avec l'aide de Claude. Partagée avec
 la cohorte de pairs comme base de travail et de critique.*

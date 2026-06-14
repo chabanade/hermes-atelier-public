@@ -1,5 +1,5 @@
 # Hermès mains-libres en voiture — Architecture voix↔IA
-**Architecte technique · 3 juin 2026 · pour Mehdi (une PME)**
+**Architecte technique · 3 juin 2026 · pour Mehdi**
 
 Objectif : boucler la boucle **vocal Mehdi → texte → Hermès → texte → vocal Mehdi**, sans toucher le téléphone, évolutif vers WhatsApp et Meta Ray-Ban, zéro maintenance, budget mini, RGPD.
 

@@ -7,7 +7,7 @@ Deux files d'attente distinctes, relevées par deux ouvriers différents :
 | File | Chemin | Relevée par | Environnement |
 |------|--------|-------------|---------------|
 | Ouvrier local | `/opt/data/claude-queue/` | Aiguilleur hôte (hors conteneur) | Claude Code serveur — 14 skills intégrés, connecteurs MCP (Rexel, AGEA, Drive, Notion, Slack, Gmail) |
-| Ouvrier PC | `/opt/data/claude-queue-pc/` | PC de Mehdi (VOTRE_USER ou un PC perso) | Claude Code sur le PC de Mehdi — a accès aux skills personnalisés (mehdi-twin, skills métier) |
+| Ouvrier PC | `/opt/data/claude-queue-pc/` | PC de Mehdi (VOTRE_USER) | Claude Code sur le PC de Mehdi — a accès aux skills personnalisés (mehdi-twin, skills métier) |
 
 ## Protocole
 
@@ -32,7 +32,7 @@ Deux files d'attente distinctes, relevées par deux ouvriers différents :
 - Connecteurs : Rexel, AGEA, Google Drive, Notion, Slack, Gmail, Audible
 - Idéal pour : recherches web, revue de code, automatisation
 
-**Ouvrier PC** (VOTRE_USER/un PC perso) :
+**Ouvrier PC** (VOTRE_USER) :
 - Skills personnalisés de Mehdi (mehdi-twin, LEXIA, skills métier)
 - Accès aux fichiers locaux de Mehdi
 - Idéal pour : tâches nécessitant le jumeau numérique, contexte métier avancé
